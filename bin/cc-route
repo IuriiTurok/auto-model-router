@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# cc-route — launch a `claude` session with the model picked by the
+# auto-model-router based on the first prompt.
+#
+# Usage:
+#   cc-route "<prompt>"               # classify, then launch claude --model X "<prompt>"
+#   cc-route --dry-run "<prompt>"     # classify only, print decision, don't launch
+#   cc-route --show-last              # print most recent audit log entry, no launch
+#   cc-route --haiku "<prompt>"       # bypass classifier, force haiku
+#   cc-route --sonnet "<prompt>"      # bypass classifier, force sonnet
+#   cc-route --opus "<prompt>"        # bypass classifier, force opus
+#   cc-route --help                   # show this message
+#
+# Anything after the prompt that doesn't look like a flag is passed
+# through to `claude` (e.g. `cc-route "fix bug" --resume <id>`).
+#-END-USAGE-
+
+set -eu
+
+ROUTER_HOOK="${HOME}/.claude/plugins/auto-model-router/hooks/auto-router.py"
+AUDIT_LOG="${HOME}/.claude/cache/router/audit.jsonl"
+
+print_usage() {
+  sed -n '/^# cc-route/,/^#-END-USAGE-/p' "$0" | sed -e '/^#-END-USAGE-/d' -e 's/^# \{0,1\}//'
+}
+
+force_model=""
+dry_run=0
+prompt=""
+passthrough=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --help|-h) print_usage; exit 0 ;;
+    --dry-run) dry_run=1; shift ;;
+    --haiku)   force_model="haiku"; shift ;;
+    --sonnet)  force_model="sonnet"; shift ;;
+    --opus)    force_model="opus"; shift ;;
+    --show-last)
+      if [ ! -f "$AUDIT_LOG" ]; then
+        echo "No audit log yet at $AUDIT_LOG" >&2
+        exit 1
+      fi
+      tail -n 1 "$AUDIT_LOG" | python3 -m json.tool
+      exit 0
+      ;;
+    --) shift; passthrough+=("$@"); break ;;
+    -*) passthrough+=("$1"); shift ;;
+    *)
+      if [ -z "$prompt" ]; then
+        prompt="$1"
+      else
+        passthrough+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$prompt" ] && [ "$dry_run" -eq 0 ] && [ -z "$force_model" ]; then
+  print_usage
+  exit 1
+fi
+
+if [ -n "$force_model" ]; then
+  model="$force_model"
+  tier="override"
+  case "$force_model" in
+    haiku) effort="low" ;;
+    sonnet) effort="medium" ;;
+    opus) effort="high" ;;
+  esac
+  confidence="1.00"
+  band="auto"
+  reason="user override --${force_model}"
+else
+  if [ ! -f "$ROUTER_HOOK" ]; then
+    echo "cc-route: router hook not found at $ROUTER_HOOK" >&2
+    exit 1
+  fi
+
+  # Run the classifier and parse the decision in one python call.
+  decision_line=$(PROMPT="$prompt" ROUTER_HOOK="$ROUTER_HOOK" python3 <<'PY'
+import json, os, subprocess, sys
+
+prompt = os.environ["PROMPT"]
+hook = os.environ["ROUTER_HOOK"]
+
+proc = subprocess.run(
+    ["python3", hook],
+    input=json.dumps({"prompt": prompt}).encode(),
+    capture_output=True, timeout=10,
+)
+if not proc.stdout:
+    sys.exit("cc-route: classifier returned no output (was the prompt too short?)")
+
+try:
+    out = json.loads(proc.stdout)
+except json.JSONDecodeError:
+    sys.exit("cc-route: classifier output was not JSON")
+
+ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
+start = ctx.find("<router-decision>")
+end = ctx.find("</router-decision>")
+if start == -1 or end == -1:
+    sys.exit("cc-route: no <router-decision> block in classifier output")
+
+d = json.loads(ctx[start + len("<router-decision>"):end].strip())
+print(
+    "|".join([
+        d.get("tier", "?"),
+        d.get("model", "?"),
+        d.get("effort", "?"),
+        f"{float(d.get('confidence', 0)):.2f}",
+        d.get("band", "?"),
+        (d.get("reason", "") or "").replace("|", "/"),
+    ]),
+    end="",
+)
+PY
+)
+  IFS='|' read -r tier model effort confidence band reason <<<"$decision_line"
+fi
+
+printf '[cc-route] tier=%s model=%s effort=%s confidence=%s band=%s\n' \
+  "$tier" "$model" "$effort" "$confidence" "$band" >&2
+printf '          reason: %s\n' "$reason" >&2
+
+if [ "$dry_run" -eq 1 ]; then
+  exit 0
+fi
+
+if [ "$band" = "ask" ]; then
+  printf 'Confidence is %s. Launch with --model %s anyway? [Y/n/o(pus)/s(onnet)/h(aiku)] ' \
+    "$confidence" "$model" >&2
+  read -r answer || answer=""
+  case "${answer:-y}" in
+    [Yy]*|"") ;;
+    [Oo]*) model="opus" ;;
+    [Ss]*) model="sonnet" ;;
+    [Hh]*) model="haiku" ;;
+    *) echo "cc-route: aborted" >&2; exit 0 ;;
+  esac
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "cc-route: 'claude' CLI not on PATH; cannot launch session" >&2
+  exit 1
+fi
+
+exec claude --model "$model" "${passthrough[@]+"${passthrough[@]}"}" "$prompt"

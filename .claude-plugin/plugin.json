@@ -1,0 +1,8 @@
+{
+  "name": "auto-model-router",
+  "version": "0.1.0",
+  "description": "Per-prompt model routing for Claude Code. Heuristic + Haiku classifier picks the right model tier; high-confidence prompts auto-delegate to a worker subagent of the chosen model. Plan-mode tags every step with Model: + Effort:.",
+  "author": {
+    "name": "iuriiturok"
+  }
+}

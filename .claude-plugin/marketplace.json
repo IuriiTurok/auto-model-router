@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "auto-model-router-mp",
+  "description": "Single-plugin marketplace for auto-model-router — per-prompt model routing for Claude Code (haiku/sonnet/opus selection by intent classification, plan-mode model tags, worker subagents).",
+  "owner": {
+    "name": "iuriiturok"
+  },
+  "plugins": [
+    {
+      "name": "auto-model-router",
+      "description": "Per-prompt model routing for Claude Code. Classifies each prompt into a tier (trivial/standard/complex/deep), auto-delegates work to a router-{haiku|sonnet|opus} worker subagent at high confidence, asks before delegating when ambiguous. Plan mode enforces per-step Model: tags. Bundles a UserPromptSubmit hook, two skills, three subagents, two slash commands, and a cc-route CLI wrapper for session-launch routing.",
+      "author": {
+        "name": "iuriiturok"
+      },
+      "category": "development",
+      "source": "./",
+      "homepage": "https://github.com/iuriiturok/auto-model-router"
+    }
+  ]
+}

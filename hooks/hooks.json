@@ -1,0 +1,16 @@
+{
+  "description": "auto-model-router hooks",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/auto-router.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

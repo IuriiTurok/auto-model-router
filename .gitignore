@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local-only debug/test cache (audit log + classification cache live
+# in ~/.claude/cache/router/, never inside the plugin folder, so they
+# don't need to be ignored here — but if you create scratch files
+# during development they belong in /tmp, not in the plugin).
+scratch/
+*.log
