@@ -22,6 +22,8 @@ Opt outs:
   - Override decision: prompt contains `#model=opus` / `#model=sonnet`
     / `#model=haiku`.
 """
+
+import glob
 import hashlib
 import json
 import os
@@ -40,6 +42,12 @@ HAIKU_TIMEOUT_SEC = 0.5
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 MAX_PROMPT_CHARS_TO_API = 2000
 PROJECT_CONFIG_FILENAME = ".claude/router.json"
+
+# Audit log rotation
+AUDIT_ROTATE_BYTES = int(
+    os.environ.get("CC_ROUTER_AUDIT_MAX_BYTES", str(5 * 1024 * 1024))
+)
+AUDIT_RETAIN_DAYS = int(os.environ.get("CC_ROUTER_AUDIT_RETAIN_DAYS", "30"))
 
 DEFAULT_AUTO_THRESHOLD = float(os.environ.get("CC_ROUTER_AUTO_THRESHOLD", "0.80"))
 DEFAULT_ASK_THRESHOLD = float(os.environ.get("CC_ROUTER_ASK_THRESHOLD", "0.50"))
@@ -108,6 +116,7 @@ def apply_project_rules(prompt: str, cfg: dict) -> dict | None:
             }
     return None
 
+
 LOOKUP_VERBS = re.compile(
     r"^(list|show|what|where|when|who|which|find|count|how many|status|read|print|"
     r"display|tell me|summari[sz]e|name |give me|do you have)\b",
@@ -136,8 +145,11 @@ def classify_heuristic(prompt: str) -> dict | None:
 
     if DEEP_VERBS.search(lower):
         return {
-            "tier": "deep", "model": "opus", "effort": "xhigh",
-            "confidence": 0.85, "source": "heuristic",
+            "tier": "deep",
+            "model": "opus",
+            "effort": "xhigh",
+            "confidence": 0.85,
+            "source": "heuristic",
             "reasoning": "explicit design/plan/investigate intent",
         }
     if COMPLEX_VERBS.search(lower):
@@ -146,22 +158,36 @@ def classify_heuristic(prompt: str) -> dict | None:
         # auto-route as confidently as a paragraph-long refactor request.
         conf = 0.85 if nontrivial else 0.75
         return {
-            "tier": "complex", "model": "opus", "effort": "high",
-            "confidence": conf, "source": "heuristic",
+            "tier": "complex",
+            "model": "opus",
+            "effort": "high",
+            "confidence": conf,
+            "source": "heuristic",
             "reasoning": "complex task verb (refactor/implement/migrate/etc.)",
         }
-    if (words <= 12 and chars <= 80 and not has_code and lines <= 2
-            and LOOKUP_VERBS.match(lower)):
+    if (
+        words <= 12
+        and chars <= 80
+        and not has_code
+        and lines <= 2
+        and LOOKUP_VERBS.match(lower)
+    ):
         return {
-            "tier": "trivial", "model": "haiku", "effort": "low",
-            "confidence": 0.9, "source": "heuristic",
+            "tier": "trivial",
+            "model": "haiku",
+            "effort": "low",
+            "confidence": 0.9,
+            "source": "heuristic",
             "reasoning": "short lookup phrasing",
         }
-    if (5 <= words <= 60 and not has_code and lines <= 5):
+    if 5 <= words <= 60 and not has_code and lines <= 5:
         # Catch-all for normal-length prompts without complex/deep verbs.
         return {
-            "tier": "standard", "model": "sonnet", "effort": "medium",
-            "confidence": 0.75, "source": "heuristic",
+            "tier": "standard",
+            "model": "sonnet",
+            "effort": "medium",
+            "confidence": 0.75,
+            "source": "heuristic",
             "reasoning": "moderate scope, no complex signals",
         }
     return None
@@ -246,14 +272,35 @@ def detect_plan_mode(payload: dict) -> bool:
     fields; we look at any embedded markers conservatively.
     """
     raw = json.dumps(payload).lower()
-    return ("plan mode is active" in raw or
-            "exitplanmode" in raw or
-            payload.get("plan_mode") is True)
+    return (
+        "plan mode is active" in raw
+        or "exitplanmode" in raw
+        or payload.get("plan_mode") is True
+    )
+
+
+def audit_rotate_if_needed() -> None:
+    """Rotate audit.jsonl when it exceeds AUDIT_ROTATE_BYTES; prune rotated
+    files older than AUDIT_RETAIN_DAYS. Silent on failure."""
+    try:
+        if os.path.exists(AUDIT_LOG) and os.path.getsize(AUDIT_LOG) >= AUDIT_ROTATE_BYTES:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            os.rename(AUDIT_LOG, f"{AUDIT_LOG}.{stamp}")
+        cutoff = time.time() - AUDIT_RETAIN_DAYS * 86400
+        for path in glob.glob(f"{AUDIT_LOG}.*"):
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def audit_append(record: dict) -> None:
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
+        audit_rotate_if_needed()
         with open(AUDIT_LOG, "a") as f:
             f.write(json.dumps(record) + "\n")
     except OSError:
@@ -289,8 +336,11 @@ def main() -> int:
         forced = override.group(1).lower()
         effort_map = {"haiku": "low", "sonnet": "medium", "opus": "high"}
         result = {
-            "tier": "override", "model": forced, "effort": effort_map[forced],
-            "confidence": 1.0, "source": "override",
+            "tier": "override",
+            "model": forced,
+            "effort": effort_map[forced],
+            "confidence": 1.0,
+            "source": "override",
             "reasoning": f"user override #model={forced}",
         }
     else:
@@ -300,10 +350,12 @@ def main() -> int:
             pinned = project_cfg["default_model"]
             effort_map = {"haiku": "low", "sonnet": "medium", "opus": "high"}
             result = {
-                "tier": "project_default", "model": pinned,
+                "tier": "project_default",
+                "model": pinned,
                 "effort": effort_map.get(pinned, "medium"),
-                "confidence": 0.95, "source": "project_config",
-                "reasoning": f"project default_model={pinned} from {project_cfg.get('_source','')}",
+                "confidence": 0.95,
+                "source": "project_config",
+                "reasoning": f"project default_model={pinned} from {project_cfg.get('_source', '')}",
             }
         if result is None:
             result = cache_get(prompt)
@@ -315,8 +367,11 @@ def main() -> int:
                         result = haiku
                 if result is None:
                     result = {
-                        "tier": "standard", "model": "sonnet", "effort": "medium",
-                        "confidence": 0.5, "source": "default",
+                        "tier": "standard",
+                        "model": "sonnet",
+                        "effort": "medium",
+                        "confidence": 0.5,
+                        "source": "default",
                         "reasoning": "no heuristic match; Haiku unavailable or timed out",
                     }
                 cache_put(prompt, result)
@@ -341,12 +396,14 @@ def main() -> int:
 
     # Suppress the silent band entirely; nothing to inject.
     if band == "none" and not plan_mode:
-        audit_append({
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
-            "decision": decision,
-            "outcome": "silent",
-        })
+        audit_append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
+                "decision": decision,
+                "outcome": "silent",
+            }
+        )
         return 0
 
     if plan_mode:
@@ -378,8 +435,8 @@ def main() -> int:
     msg = (
         f"[auto-router] tier={result['tier']} model={result['model']} "
         f"effort={result['effort']} confidence={decision['confidence']:.2f} "
-        f"source={result.get('source','')} band={band} plan_mode={plan_mode}\n"
-        f"Reason: {result.get('reasoning','')}\n\n"
+        f"source={result.get('source', '')} band={band} plan_mode={plan_mode}\n"
+        f"Reason: {result.get('reasoning', '')}\n\n"
         f"{instruction}\n\n"
         "<router-decision>\n"
         f"{json.dumps(decision)}\n"
@@ -387,19 +444,25 @@ def main() -> int:
         "(Override: `#model=opus|sonnet|haiku`. Suppress: `#noshift`.)"
     )
 
-    audit_append({
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
-        "decision": decision,
-        "outcome": "injected",
-    })
-
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": msg,
+    audit_append(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
+            "decision": decision,
+            "outcome": "injected",
         }
-    }))
+    )
+
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": msg,
+                }
+            }
+        )
+    )
     return 0
 
 
