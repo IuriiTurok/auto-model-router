@@ -11,8 +11,10 @@ Print a summary of recent auto-router activity.
 1. **Last 20 decisions** (most recent first):
 
    ```bash
-   tail -n 20 ~/.claude/cache/router/audit.jsonl | tac
+   tail -n 20 ~/.claude/cache/router/audit.jsonl | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}'
    ```
+
+   (`tac` is Linux-only — the awk reverse works on macOS too.)
 
    Render each as a compact line:
    `<ts>  <band>  <model>/<effort>  conf=<0.xx>  <reason — truncated>`
