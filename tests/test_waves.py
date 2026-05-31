@@ -7,6 +7,12 @@ Exit 0 if all pass; 1 otherwise.
 
 import os
 import sys
+import tempfile
+
+# Isolate any router cache/audit writes from the real ~/.claude/cache/router/.
+# waves.py is pure today, but this keeps the suite from touching the prod cache
+# if it ever grows to exercise auto-router.py. Mirrors tests/run.sh.
+os.environ.setdefault("CC_ROUTER_CACHE_DIR", tempfile.mkdtemp())
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hooks"))
 
@@ -88,7 +94,9 @@ check(
 )
 
 # diamond full execution: wave1=[[1]], wave2=[[2,3]] (read-only => one batch), wave3=[[4]]
-diamond_exec = [[[s["id"] for s in b] for b in wave] for wave in plan_execution(diamond)]
+diamond_exec = [
+    [[s["id"] for s in b] for b in wave] for wave in plan_execution(diamond)
+]
 check("e2: diamond plan_execution shape", diamond_exec == [[[1]], [[2, 3]], [[4]]])
 
 # cycle detection

@@ -37,7 +37,9 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-CACHE_DIR = os.path.expanduser("~/.claude/cache/router")
+CACHE_DIR = os.path.expanduser(
+    os.environ.get("CC_ROUTER_CACHE_DIR", "~/.claude/cache/router")
+)
 AUDIT_LOG = os.path.join(CACHE_DIR, "audit.jsonl")
 CACHE_TTL_SEC = 7 * 86400
 HAIKU_TIMEOUT_SEC = 1.5

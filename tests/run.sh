@@ -22,6 +22,12 @@ if [ ! -f "$FIXTURES" ]; then
   exit 2
 fi
 
+# Redirect the router's cache + audit writes to a throwaway dir so running the
+# fixtures never pollutes the real ~/.claude/cache/router/ (audit.jsonl
+# distribution + 7-day classification cache). auto-router.py honours this var.
+export CC_ROUTER_CACHE_DIR="$(mktemp -d)"
+trap 'rm -rf "$CC_ROUTER_CACHE_DIR"' EXIT
+
 PASS=0
 FAIL=0
 LINE=0
