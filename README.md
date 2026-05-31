@@ -58,6 +58,26 @@ Plan mode is **parent-authoritative**: the `UserPromptSubmit` hook can't see
 plan state (the payload has no plan flag), so the parent decides from its own
 context and the `plan_mode` field in the decision block is best-effort only.
 
+## Goals & reporting
+
+The router serves three north-star goals, defined in [GOALS.md](GOALS.md):
+
+1. **Cost efficiency** — estimated $ saved by routing work to the cheapest
+   sufficient model (vs an all-Opus counterfactual).
+2. **Quality** — user-correction rate, router-delegated vs inline. The router
+   cohort must not be worse.
+3. **Time-to-results** — time-to-first-approval + wall-clock saved by
+   parallelism.
+
+`/router-report [7d|1d|yesterday] [--llm-judge]` scores all three over a
+window. It reads the audit log + session transcripts (joined by `prompt_sha`),
+writes a dated report to `~/.claude/cache/router/reports/`, appends **lessons
+learned**, and **offers** concrete, data-derived tweaks (it never applies them
+silently). The deterministic core is `tools/usage-report.py` (run it directly
+with `--json` for machine output); correction detection is heuristic unless
+`--llm-judge` adds a Haiku pass. All figures are estimates and the
+router-vs-inline timing comparison is correlation, not causation.
+
 ## Components
 
 ```
@@ -65,11 +85,13 @@ auto-model-router/
 ├── .claude-plugin/
 │   ├── marketplace.json     # single-plugin marketplace manifest
 │   └── plugin.json          # plugin metadata
+├── GOALS.md                 # the three north-star KPIs (cost/quality/time)
 ├── hooks/
 │   ├── auto-router.py       # UserPromptSubmit hook — the classifier (+ fanout)
 │   ├── post-agent-audit.py  # PostToolUse — outcome capture (tokens, wall, group)
 │   ├── pre-agent-mark.py    # PreToolUse — start-time marker for wall-clock
 │   ├── waves.py             # pure DAG→waves + non-interference batching
+│   ├── pricing.py           # per-MTok price table for the cost KPI
 │   └── hooks.json           # hook registration (auto-loaded by Claude Code)
 ├── skills/
 │   ├── auto-model-routing/SKILL.md   # parent: read decision → delegate / fan out
@@ -80,13 +102,16 @@ auto-model-router/
 │   └── router-opus.md       # worker subagent_type, model=opus
 ├── commands/
 │   ├── route.md             # /route <prompt>  — force re-classify
-│   └── route-status.md      # /route-status   — recent decisions + parallelism
+│   ├── route-status.md      # /route-status   — recent decisions + parallelism
+│   └── router-report.md     # /router-report  — KPI report + lessons + offers
 ├── tools/
-│   └── analyze-audit.py     # distribution + parallelism analyzer
+│   ├── analyze-audit.py     # distribution + parallelism analyzer
+│   └── usage-report.py      # KPI usage report (cost / quality / time)
 ├── tests/
 │   ├── fixtures.jsonl       # golden classifier cases (+ fanout)
-│   ├── run.sh               # classifier fixture harness
-│   └── test_waves.py        # wave/non-interference unit tests
+│   ├── run.sh               # full suite entrypoint (fixtures + both py suites)
+│   ├── test_waves.py        # wave/non-interference unit tests
+│   └── test_usage_report.py # KPI report unit tests
 ├── bin/
 │   ├── cc-route             # CLI wrapper for session-launch routing
 │   └── install.sh           # post-install: symlink cc-route to PATH

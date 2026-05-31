@@ -5,12 +5,15 @@ compute wall-clock duration.
 
 Skips non-router subagent dispatches. Idempotent and silent on any error.
 """
+
 import json
 import os
 import sys
 import time
 
-CACHE_DIR = os.path.expanduser("~/.claude/cache/router")
+CACHE_DIR = os.path.expanduser(
+    os.environ.get("CC_ROUTER_CACHE_DIR", "~/.claude/cache/router")
+)
 MARK_DIR = os.path.join(CACHE_DIR, "agent-marks")
 
 

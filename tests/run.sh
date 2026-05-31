@@ -83,6 +83,16 @@ print(ctx[start:end])
   fi
 done < "$FIXTURES"
 
-echo "---"
-echo "PASS=$PASS FAIL=$FAIL"
-[ "$FAIL" -eq 0 ]
+echo "--- classifier fixtures: PASS=$PASS FAIL=$FAIL"
+
+# Run the pure-Python unit suites too, so `bash tests/run.sh` is the one
+# entrypoint for the whole test suite. They isolate their own temp dirs.
+SUITE_FAIL=$FAIL
+echo "=== tests/test_waves.py ==="
+python3 "$DIR/test_waves.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
+echo "=== tests/test_usage_report.py ==="
+python3 "$DIR/test_usage_report.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
+
+echo "==="
+[ "$SUITE_FAIL" -eq 0 ] && echo "ALL SUITES PASS" || echo "SUITE FAILURES: $SUITE_FAIL"
+[ "$SUITE_FAIL" -eq 0 ]

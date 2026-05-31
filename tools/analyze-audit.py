@@ -149,14 +149,16 @@ def find_parallel_batches(outcomes):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    home = os.path.expanduser("~")
+    cache_dir = os.path.expanduser(
+        os.environ.get("CC_ROUTER_CACHE_DIR", "~/.claude/cache/router")
+    )
     p.add_argument(
         "--audit",
-        default=os.path.join(home, ".claude/cache/router/audit.jsonl"),
+        default=os.path.join(cache_dir, "audit.jsonl"),
     )
     p.add_argument(
         "--overrides",
-        default=os.path.join(home, ".claude/cache/router/overrides.jsonl"),
+        default=os.path.join(cache_dir, "overrides.jsonl"),
     )
     p.add_argument(
         "--days", type=int, default=0, help="restrict to last N days (0 = all)"
@@ -342,7 +344,9 @@ def main():
                     f"  est. wall-clock saved : {saved_total} ms "
                     f"across {measurable} timed batch(es)"
                 )
-                print("    (Σ wall_ms − max wall_ms per batch — time NOT spent serially)")
+                print(
+                    "    (Σ wall_ms − max wall_ms per batch — time NOT spent serially)"
+                )
             else:
                 print("  est. wall-clock saved : n/a (batches lack wall_ms timing)")
 

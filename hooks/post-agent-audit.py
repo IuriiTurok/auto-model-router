@@ -23,7 +23,9 @@ import sys
 import time
 from datetime import datetime, timezone
 
-CACHE_DIR = os.path.expanduser("~/.claude/cache/router")
+CACHE_DIR = os.path.expanduser(
+    os.environ.get("CC_ROUTER_CACHE_DIR", "~/.claude/cache/router")
+)
 AUDIT_LOG = os.path.join(CACHE_DIR, "audit.jsonl")
 MARK_DIR = os.path.join(CACHE_DIR, "agent-marks")
 
@@ -188,7 +190,7 @@ def main() -> int:
         m = re.match(r"\s*\[grp:([^\]]+)\]\s*", desc)
         if m:
             record["group_id"] = m.group(1).strip()
-            desc = desc[m.end():]
+            desc = desc[m.end() :]
         record["description"] = desc[:80]
 
     try:
