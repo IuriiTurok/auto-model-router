@@ -92,6 +92,10 @@ echo "=== tests/test_waves.py ==="
 python3 "$DIR/test_waves.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
 echo "=== tests/test_usage_report.py ==="
 python3 "$DIR/test_usage_report.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
+echo "=== tests/test_replay_kpi.py ==="
+python3 "$DIR/test_replay_kpi.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
+echo "=== tests/test_router_loop.py ==="
+python3 "$DIR/test_router_loop.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
 
 echo "==="
 [ "$SUITE_FAIL" -eq 0 ] && echo "ALL SUITES PASS" || echo "SUITE FAILURES: $SUITE_FAIL"
