@@ -1,14 +1,14 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "auto-model-router-mp",
-  "description": "Single-plugin marketplace for auto-model-router — per-prompt model routing for Claude Code (haiku/sonnet/opus selection by intent classification, plan-mode model tags, worker subagents).",
+  "description": "Single-plugin marketplace for auto-model-router — per-prompt model + effort routing for Claude Code (haiku/sonnet/opus by intent classification), parallel wave execution for plan-mode and multi-part prompts, and a goal-anchored usage report (cost saved / correction rate / time-to-results).",
   "owner": {
     "name": "iuriiturok"
   },
   "plugins": [
     {
       "name": "auto-model-router",
-      "description": "Per-prompt model routing for Claude Code. Classifies each prompt into a tier (trivial/standard/complex/deep), auto-delegates work to a router-{haiku|sonnet|opus} worker subagent at high confidence, asks before delegating when ambiguous. Plan mode enforces per-step Model: tags. Bundles a UserPromptSubmit hook, two skills, three subagents, two slash commands, and a cc-route CLI wrapper for session-launch routing.",
+      "description": "Per-prompt model routing for Claude Code. Classifies each prompt into a tier (trivial/standard/complex/deep) with an independent effort score, auto-delegates to a router-{haiku|sonnet|opus} worker subagent at high confidence (>=0.90), and asks when ambiguous. Plan-mode and multi-part prompts fan out into parallel waves with disjoint-file non-interference. Goal-anchored: /router-report scores cost saved, user-correction rate, and time-to-results. Bundles UserPromptSubmit/PreToolUse/PostToolUse hooks, two skills (auto-model-routing, plan-with-models), three worker subagents, three slash commands, an audit + usage-report toolset, and a cc-route CLI wrapper.",
       "author": {
         "name": "iuriiturok"
       },
