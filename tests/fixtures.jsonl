@@ -11,12 +11,12 @@
 {"label":"deep-plan-short","prompt":"plan the migration","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"ask"}}
 {"label":"deep-audit","prompt":"audit the payment module for security issues","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"ask"}}
 {"label":"deep-investigate-short","prompt":"investigate why the worker pool keeps stalling under load","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"ask"}}
-{"label":"standard-readme","prompt":"can you update the readme with the new install steps and bump the version","expect":{"tier":"standard","model":"sonnet","conf_min":0.0,"band":"ask"}}
-{"label":"standard-docs","prompt":"add a section to the docs about the new feature flag","expect":{"tier":"standard","model":"sonnet","conf_min":0.0,"band":"ask"}}
+{"label":"standard-readme","prompt":"can you update the readme with the new install steps and bump the version","expect":{"tier":"standard","model":"sonnet","conf_min":0.0,"band":"auto"}}
+{"label":"standard-docs","prompt":"add a section to the docs about the new feature flag","expect":{"tier":"standard","model":"sonnet","conf_min":0.0,"band":"auto"}}
 {"label":"override-opus","prompt":"#model=opus list the open PRs","expect":{"tier":"override","model":"opus","effort":"high","conf_min":1.0,"band":"auto"}}
 {"label":"override-haiku","prompt":"#model=haiku design a new system from scratch","expect":{"tier":"override","model":"haiku","effort":"low","conf_min":1.0,"band":"auto"}}
 {"label":"override-sonnet","prompt":"#model=sonnet refactor this","expect":{"tier":"override","model":"sonnet","effort":"medium","conf_min":1.0,"band":"auto"}}
-{"label":"effort-low-on-standard","prompt":"please add a section to the user guide explaining cache behaviour","expect":{"tier":"standard","model":"sonnet","effort":"low","conf_min":0.0,"band":"ask"}}
+{"label":"effort-low-on-standard","prompt":"please add a section to the user guide explaining cache behaviour","expect":{"tier":"standard","model":"sonnet","effort":"low","conf_min":0.0,"band":"auto"}}
 {"label":"deep-rewrite-many-files","prompt":"please plan a full rewrite of the authentication and session subsystem touching api/auth.py, api/middleware.py, api/session.py, ui/login.tsx, ui/profile.tsx, tests/test_auth.py, and the migration scripts under db/migrations/; include verification, a rollback story, and a phased rollout","expect":{"tier":"deep","model":"opus","effort":"high","conf_min":0.90,"band":"auto"}}
 {"label":"fanout-and-list","prompt":"update the README, bump the version in package.json, and add a CHANGELOG entry","expect":{"fanout":true}}
 {"label":"fanout-numbered","prompt":"do these:\n1. fix the bug in auth.py\n2. add a regression test\n3. update the docs","expect":{"fanout":true}}

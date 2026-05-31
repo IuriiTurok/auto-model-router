@@ -9,7 +9,8 @@ Behaviour:
   - Results cached by SHA256(prompt) for 7 days under
     ~/.claude/cache/router/.
   - Confidence bands -> band field:
-      auto   if confidence >= AUTO_THRESHOLD  (default 0.90)
+      auto   if confidence >= AUTO_THRESHOLD  (default 0.75; opus picks
+             keep a 0.90 floor — see band_for())
       ask    if AUTO_THRESHOLD > confidence >= ASK_THRESHOLD  (default 0.60)
       none   otherwise (silent)
   - Effort (low/medium/high/xhigh) is scored independently from tier; when
@@ -57,7 +58,7 @@ AUDIT_ROTATE_BYTES = int(
 )
 AUDIT_RETAIN_DAYS = int(os.environ.get("CC_ROUTER_AUDIT_RETAIN_DAYS", "30"))
 
-DEFAULT_AUTO_THRESHOLD = float(os.environ.get("CC_ROUTER_AUTO_THRESHOLD", "0.90"))
+DEFAULT_AUTO_THRESHOLD = float(os.environ.get("CC_ROUTER_AUTO_THRESHOLD", "0.75"))
 DEFAULT_ASK_THRESHOLD = float(os.environ.get("CC_ROUTER_ASK_THRESHOLD", "0.60"))
 
 
@@ -90,6 +91,22 @@ def load_project_config(start_dir: str | None = None) -> dict:
             break
         cur = parent
     return {}
+
+
+def load_loop_config() -> dict:
+    """Global thresholds tuned by the /router-loop self-improvement loop.
+
+    Lowest precedence: a per-project .claude/router.json still overrides these,
+    and these override the hardcoded DEFAULT_*_THRESHOLD. Lives under CACHE_DIR
+    so it is naturally absent (and inert) during the test suite, which points
+    CC_ROUTER_CACHE_DIR at a throwaway dir.
+    """
+    p = os.path.join(CACHE_DIR, "loop-config", "router.json")
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
 
 
 def apply_project_rules(prompt: str, cfg: dict) -> dict | None:
@@ -380,8 +397,14 @@ def cache_put(prompt: str, result: dict) -> None:
         pass
 
 
-def band_for(confidence: float, auto_threshold: float, ask_threshold: float) -> str:
-    if confidence >= auto_threshold:
+def band_for(
+    confidence: float, auto_threshold: float, ask_threshold: float, model: str = ""
+) -> str:
+    # Asymmetric risk: misrouting to opus is the expensive failure mode, so
+    # opus picks need a higher confidence floor than cheaper models. The
+    # opus floor stays at the legacy 0.90; cheaper picks use auto_threshold.
+    effective_auto = max(auto_threshold, 0.90) if model == "opus" else auto_threshold
+    if confidence >= effective_auto:
         return "auto"
     if confidence >= ask_threshold:
         return "ask"
@@ -453,8 +476,13 @@ def main() -> int:
     if project_cfg.get("disabled") is True:
         return 0
 
-    auto_threshold = float(project_cfg.get("auto_threshold", DEFAULT_AUTO_THRESHOLD))
-    ask_threshold = float(project_cfg.get("ask_threshold", DEFAULT_ASK_THRESHOLD))
+    loop_cfg = load_loop_config()
+    auto_threshold = float(
+        project_cfg.get("auto_threshold", loop_cfg.get("auto_threshold", DEFAULT_AUTO_THRESHOLD))
+    )
+    ask_threshold = float(
+        project_cfg.get("ask_threshold", loop_cfg.get("ask_threshold", DEFAULT_ASK_THRESHOLD))
+    )
 
     # Explicit override -> emit a high-confidence auto decision and skip classification
     override = OVERRIDE_PATTERN.search(prompt)
@@ -537,7 +565,12 @@ def main() -> int:
 
     plan_mode = detect_plan_mode(payload)
     fanout, fanout_hint = detect_fanout(prompt)
-    band = band_for(float(result.get("confidence", 0)), auto_threshold, ask_threshold)
+    band = band_for(
+        float(result.get("confidence", 0)),
+        auto_threshold,
+        ask_threshold,
+        result.get("model", ""),
+    )
     decision_id = "r_" + uuid.uuid4().hex[:10]
 
     decision = {
