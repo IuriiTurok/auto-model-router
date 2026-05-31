@@ -105,6 +105,56 @@ Example for a CAD / firmware / hard-engineering project:
 The hook walks up from your `cwd` looking for the first
 `.claude/router.json`. See README for the full schema.
 
+## Manual / non-marketplace install
+
+If you wire the plugin by hand instead of via the marketplace (e.g. you
+cloned the repo straight into `~/.claude/plugins/auto-model-router/`), you
+must replicate everything the marketplace would auto-load. **`hooks/hooks.json`
+is the source of truth — mirror ALL of it, not just the first hook.** As of
+v0.3.0 that means **three** hooks:
+
+```jsonc
+// ~/.claude/settings.json → "hooks"
+"UserPromptSubmit": [
+  { "hooks": [{ "type": "command",
+    "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/auto-router.py",
+    "timeout": 5 }] }
+],
+"PreToolUse": [
+  { "matcher": "Agent", "hooks": [{ "type": "command",
+    "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/pre-agent-mark.py",
+    "timeout": 2 }] }
+],
+"PostToolUse": [
+  { "matcher": "Agent", "hooks": [{ "type": "command",
+    "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/post-agent-audit.py",
+    "timeout": 3 }] }
+]
+```
+
+Miss the `PreToolUse[Agent]` entry and the classifier still works, but
+`wall_ms` is never captured — so the parallelism / time-to-results numbers in
+`/router-report` stay empty.
+
+Then symlink the skills, subagents, and **all** commands into `~/.claude/`:
+
+```bash
+ln -sf ~/.claude/plugins/auto-model-router/skills/auto-model-routing ~/.claude/skills/auto-model-routing
+ln -sf ~/.claude/plugins/auto-model-router/skills/plan-with-models     ~/.claude/skills/plan-with-models
+for m in haiku sonnet opus; do
+  ln -sf ~/.claude/plugins/auto-model-router/agents/router-$m.md ~/.claude/agents/router-$m.md
+done
+for c in route route-status router-report; do
+  ln -sf ~/.claude/plugins/auto-model-router/commands/$c.md ~/.claude/commands/$c.md
+done
+```
+
+**Caveat:** a manual install does NOT auto-update when the plugin gains new
+hooks or commands. After pulling an upgrade, re-check `hooks/hooks.json` and
+`commands/` and add anything new by hand (this is exactly how the
+`router-report` command and the `pre-agent-mark.py` hook were missed between
+v0.1 and v0.3). The marketplace flow has none of this drift.
+
 ## Uninstall
 
 ```
@@ -125,10 +175,13 @@ slate.
 ## Troubleshooting
 
 **Hook isn't firing.**
-Check `~/.claude/settings.json` — under `hooks.UserPromptSubmit`
-there should be either a marketplace-registered entry (no manual
-edit needed) or, if you installed manually, a `command` pointing at
-the plugin path.
+Check `~/.claude/settings.json` — under `hooks` there should be either
+marketplace-registered entries (no manual edit needed) or, if you
+installed manually, command entries pointing at the plugin path. There
+are **three** hooks (UserPromptSubmit + PreToolUse[Agent] +
+PostToolUse[Agent]) — see "Manual / non-marketplace install" above.
+Settings.json hook edits take effect in new sessions (or after opening
+`/hooks` once), not mid-session.
 
 **Subagent dispatch goes to the wrong model.**
 Run `/route-status` to confirm the classifier's decision matches

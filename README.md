@@ -302,32 +302,35 @@ marketplace), you can run it from a clone:
 git clone https://github.com/<owner>/auto-model-router ~/.claude/plugins/auto-model-router
 ln -sf ~/.claude/plugins/auto-model-router/skills/auto-model-routing ~/.claude/skills/auto-model-routing
 ln -sf ~/.claude/plugins/auto-model-router/skills/plan-with-models   ~/.claude/skills/plan-with-models
-ln -sf ~/.claude/plugins/auto-model-router/agents/router-haiku.md    ~/.claude/agents/router-haiku.md
-ln -sf ~/.claude/plugins/auto-model-router/agents/router-sonnet.md   ~/.claude/agents/router-sonnet.md
-ln -sf ~/.claude/plugins/auto-model-router/agents/router-opus.md     ~/.claude/agents/router-opus.md
-ln -sf ~/.claude/plugins/auto-model-router/commands/route.md         ~/.claude/commands/route.md
-ln -sf ~/.claude/plugins/auto-model-router/commands/route-status.md  ~/.claude/commands/route-status.md
+for m in haiku sonnet opus; do
+  ln -sf ~/.claude/plugins/auto-model-router/agents/router-$m.md ~/.claude/agents/router-$m.md
+done
+for c in route route-status router-report; do
+  ln -sf ~/.claude/plugins/auto-model-router/commands/$c.md ~/.claude/commands/$c.md
+done
 ```
 
-Then add the hook to `~/.claude/settings.json`:
+Then register **all three hooks** in `~/.claude/settings.json` (mirror
+`hooks/hooks.json` — see INSTALL.md → "Manual / non-marketplace install" for
+the full block):
 
 ```jsonc
 "hooks": {
-  "UserPromptSubmit": [{
-    "hooks": [{
-      "type": "command",
-      "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/auto-router.py",
-      "timeout": 5
-    }]
-  }]
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command",
+    "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/auto-router.py", "timeout": 5 }] }],
+  "PreToolUse":  [{ "matcher": "Agent", "hooks": [{ "type": "command",
+    "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/pre-agent-mark.py", "timeout": 2 }] }],
+  "PostToolUse": [{ "matcher": "Agent", "hooks": [{ "type": "command",
+    "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/post-agent-audit.py", "timeout": 3 }] }]
 }
 ```
 
 And run `bin/install.sh` for the `cc-route` PATH symlink.
 
-The symlink dance and manual hook entry are needed only because you're
-bypassing the marketplace install. Teammates using the marketplace flow
-don't do any of this.
+The symlink dance and manual hook entries are needed only because you're
+bypassing the marketplace install — and they don't auto-update when the plugin
+gains new hooks/commands, so re-check `hooks/hooks.json` after upgrades.
+Teammates using the marketplace flow don't do any of this.
 
 ## Known limitations
 
