@@ -47,7 +47,7 @@ PROJECT_CONFIG_FILENAME = ".claude/router.json"
 
 # Bumped whenever classifier output or thresholds change; cache_get treats
 # entries with a different version as a miss so old entries naturally expire.
-CLASSIFIER_VERSION = 3
+CLASSIFIER_VERSION = 4
 
 # Audit log rotation
 AUDIT_ROTATE_BYTES = int(
@@ -150,6 +150,40 @@ EFFORT_HEAVY_VERBS = re.compile(
 )
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh")
 TEST_VERIFY = re.compile(r"\b(test|tests|verify|verification|spec|specs)\b", re.I)
+
+NUMBERED_ITEM = re.compile(r"^\s*\d+[.)]\s+\S", re.M)
+BULLET_ITEM = re.compile(r"^\s*[-*•]\s+\S", re.M)
+FOR_EACH = re.compile(r"\bfor (each|all of|every|both)\b", re.I)
+IMPERATIVE_VERB = re.compile(
+    r"\b(add|update|fix|create|write|refactor|remove|delete|rename|bump|"
+    r"implement|build|run|test|document|review|check|move|generate|wire|"
+    r"replace|migrate|extract|install|configure|set up)\b",
+    re.I,
+)
+
+
+def detect_fanout(prompt: str) -> tuple[bool, int]:
+    """Detect a prompt that decomposes into independent subtasks.
+
+    Conservative on purpose (auto-band fans out only on UNMISTAKABLE
+    multi-part prompts per the project's routing policy). Returns
+    (is_fanout, hint) where hint is a best-estimate subtask count, or 0
+    when the count is unknown ("for each …" over an unenumerated set).
+    """
+    numbered = len(NUMBERED_ITEM.findall(prompt))
+    if numbered >= 2:
+        return True, numbered
+    bullets = len(BULLET_ITEM.findall(prompt))
+    if bullets >= 3:
+        return True, bullets
+    if FOR_EACH.search(prompt):
+        return True, 0
+    # ≥3 distinct imperative verbs joined by conjunctions in a single ask.
+    has_conjunction = " and " in prompt.lower() or ";" in prompt
+    verbs = {m.group(1).lower() for m in IMPERATIVE_VERB.finditer(prompt)}
+    if has_conjunction and len(verbs) >= 3:
+        return True, len(verbs)
+    return False, 0
 
 
 def classify_heuristic(prompt: str) -> dict | None:
@@ -500,6 +534,7 @@ def main() -> int:
             )
 
     plan_mode = detect_plan_mode(payload)
+    fanout, fanout_hint = detect_fanout(prompt)
     band = band_for(float(result.get("confidence", 0)), auto_threshold, ask_threshold)
     decision_id = "r_" + uuid.uuid4().hex[:10]
 
@@ -512,10 +547,13 @@ def main() -> int:
         "reason": result.get("reasoning", ""),
         "source": result.get("source", ""),
         "plan_mode": plan_mode,
+        "fanout": fanout,
         "decision_id": decision_id,
         "thresholds": {"auto": auto_threshold, "ask": ask_threshold},
         "project_config": project_cfg.get("_source"),
     }
+    if fanout:
+        decision["fanout_hint"] = fanout_hint
 
     # Suppress the silent band entirely; nothing to inject.
     if band == "none" and not plan_mode:
@@ -538,6 +576,16 @@ def main() -> int:
             "differ (cheap reads/edits = haiku/sonnet; deep refactor/debug = opus). "
             "Use the `plan-with-models` skill for the canonical step template."
         )
+    elif band == "auto" and fanout:
+        instruction = (
+            f"AUTO-ROUTE + FAN-OUT: this prompt looks decomposable (~{fanout_hint} "
+            "independent subtasks). Follow Branch E of the `auto-model-routing` "
+            "skill: split it into subtasks, classify each to the cheapest "
+            "sufficient model, and dispatch the independent ones as ONE message of "
+            "concurrent Agent() calls — but only parallelise writers whose file "
+            "sets are disjoint (read-only subtasks are always safe). Then "
+            "synthesise the results in 1-2 sentences."
+        )
     elif band == "auto":
         instruction = (
             f"AUTO-ROUTE: dispatch this prompt to a `router-{result['model']}` "
@@ -548,17 +596,36 @@ def main() -> int:
             "procedure."
         )
     else:  # band == "ask"
+        fan_note = (
+            " (This prompt also looks decomposable — if you delegate, consider "
+            "Branch E fan-out across independent subtasks.)"
+            if fanout
+            else ""
+        )
         instruction = (
             f"AMBIGUOUS classification ({band}, confidence={decision['confidence']}). "
             f"Before doing the work, call AskUserQuestion with options "
             f"[Use {result['model']} (Recommended)] [Use Opus] [Stay on current]. "
-            "Honour the answer. Use the `auto-model-routing` skill for the procedure."
+            f"Honour the answer. Use the `auto-model-routing` skill for the procedure.{fan_note}"
         )
 
+    # Plan mode is parent-authoritative: the hook cannot see it reliably (the
+    # UserPromptSubmit payload carries no plan-mode flag), so remind the parent
+    # to trust its own context over the best-effort plan_mode field below.
+    if not plan_mode:
+        instruction += (
+            "\n\nIf you are actually in PLAN MODE right now (a system reminder "
+            "says so), ignore the routing above and use the `plan-with-models` "
+            "skill instead — the plan_mode field below is best-effort and is "
+            "often stale."
+        )
+
+    fanout_tag = f" fanout={fanout_hint or 'y'}" if fanout else ""
     msg = (
         f"[auto-router] tier={result['tier']} model={result['model']} "
         f"effort={result['effort']} confidence={decision['confidence']:.2f} "
-        f"source={result.get('source', '')} band={band} plan_mode={plan_mode}\n"
+        f"source={result.get('source', '')} band={band} plan_mode={plan_mode}"
+        f"{fanout_tag}\n"
         f"Reason: {result.get('reasoning', '')}\n\n"
         f"{instruction}\n\n"
         "<router-decision>\n"

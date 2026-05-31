@@ -51,7 +51,22 @@ Print a summary of recent auto-router activity.
    PY
    ```
 
-3. **Cache size**:
+3. **Parallelism (last 7 days)** — fan-out width + wall-clock saved.
+   Reuse the analyzer rather than re-deriving it; it already computes the
+   parallel-batch detection (explicit `group_id` + inferred overlapping
+   execution windows):
+
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/tools/analyze-audit.py" --days 7 \
+     | sed -n '/5b. PARALLELISM/,/^6\./p' | sed '$d'
+   ```
+
+   Surface the three lines that matter: **parallel batches**, **median
+   fan-out width**, **est. wall-clock saved**. If it reports "no parallel
+   batches detected," show `Parallelism: none yet` — fan-out hasn't fired
+   (or predates `group_id` capture).
+
+4. **Cache size**:
 
    ```bash
    ls ~/.claude/cache/router/*.json 2>/dev/null | wc -l
@@ -59,5 +74,5 @@ Print a summary of recent auto-router activity.
 
    Report as: `<N> cached classifications`.
 
-4. If `audit.jsonl` is missing or empty, print:
+5. If `audit.jsonl` is missing or empty, print:
    `No auto-router activity yet. Send a prompt to see decisions.`

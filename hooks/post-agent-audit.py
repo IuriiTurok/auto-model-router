@@ -138,9 +138,7 @@ def main() -> int:
         return 0
 
     model = subagent_type[len("router-") :] or "?"
-    tool_response = (
-        payload.get("toolResponse") or payload.get("tool_response") or {}
-    )
+    tool_response = payload.get("toolResponse") or payload.get("tool_response") or {}
 
     ok = True
     if isinstance(tool_response, dict):
@@ -170,9 +168,7 @@ def main() -> int:
         "decision_id": find_last_injected_decision_id(),
     }
 
-    wall_ms = read_wall_ms(
-        payload.get("toolUseId") or payload.get("tool_use_id")
-    )
+    wall_ms = read_wall_ms(payload.get("toolUseId") or payload.get("tool_use_id"))
     if wall_ms is not None:
         record["wall_ms"] = wall_ms
 
@@ -185,7 +181,15 @@ def main() -> int:
 
     desc = tool_input.get("description")
     if desc:
-        record["description"] = str(desc)[:80]
+        desc = str(desc)
+        # Parallel-batch correlation: plan-with-models / Branch E prefix the
+        # description with "[grp:<id>]" so concurrent dispatches in one batch
+        # share a group_id. Lets the analyzer measure fan-out width precisely.
+        m = re.match(r"\s*\[grp:([^\]]+)\]\s*", desc)
+        if m:
+            record["group_id"] = m.group(1).strip()
+            desc = desc[m.end():]
+        record["description"] = desc[:80]
 
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)

@@ -90,6 +90,63 @@ def print_counter(c, total, limit=None):
         print(f"  {str(k):<32} {v:>5}  {pct(v, total):>7}")
 
 
+def find_parallel_batches(outcomes):
+    """Identify concurrently-run subagent batches from outcome rows.
+
+    Two sources:
+      1. Explicit: rows sharing a `group_id` (set by plan-with-models /
+         Branch E when it fans out) — exact.
+      2. Inferred: rows with `ts` + `wall_ms` whose execution windows
+         [ts - wall_ms, ts] overlap — covers fan-outs that predate group_id
+         tagging. ts is logged at completion, so start = end - duration.
+
+    Returns list of batches; each batch is a list of (wall_ms_or_None) for
+    its members. Only batches of size >= 2 are returned (a batch of 1 is
+    not parallelism).
+    """
+    batches = []
+    used = set()
+
+    # 1. explicit group_id batches
+    by_group = defaultdict(list)
+    for i, r in enumerate(outcomes):
+        gid = r.get("group_id")
+        if gid:
+            by_group[gid].append(i)
+    for gid, idxs in by_group.items():
+        if len(idxs) >= 2:
+            batches.append([outcomes[i].get("wall_ms") for i in idxs])
+            used.update(idxs)
+
+    # 2. inferred from overlapping execution windows (ungrouped rows only)
+    windows = []
+    for i, r in enumerate(outcomes):
+        if i in used:
+            continue
+        end = parse_ts(r.get("ts"))
+        wall = r.get("wall_ms")
+        if end is None or not isinstance(wall, int):
+            continue
+        start = end.timestamp() - wall / 1000.0
+        windows.append((start, end.timestamp(), wall))
+    windows.sort()
+    cluster = []
+    cluster_end = None
+    for start, end, wall in windows:
+        if cluster and start <= cluster_end:  # overlaps current cluster
+            cluster.append(wall)
+            cluster_end = max(cluster_end, end)
+        else:
+            if len(cluster) >= 2:
+                batches.append(cluster)
+            cluster = [wall]
+            cluster_end = end
+    if len(cluster) >= 2:
+        batches.append(cluster)
+
+    return batches
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     home = os.path.expanduser("~")
@@ -260,6 +317,34 @@ def main():
                 print(
                     f"    {m:<10} n={len(ws):>4}  median={int(statistics.median(ws)):>6}"
                 )
+
+        # ── Parallelism (fan-out width + wall-clock saved) ───────────────
+        batches = find_parallel_batches(outcomes)
+        section("5b. PARALLELISM")
+        if not batches:
+            print("  no parallel batches detected (no group_id, no overlapping")
+            print("  execution windows). Fan-out either unused or not yet captured.")
+        else:
+            widths = [len(b) for b in batches]
+            saved_total = 0
+            measurable = 0
+            for b in batches:
+                walls = [w for w in b if isinstance(w, int)]
+                if len(walls) >= 2:
+                    saved_total += sum(walls) - max(walls)
+                    measurable += 1
+            print(f"  parallel batches      : {len(batches)}")
+            print(f"  median fan-out width  : {int(statistics.median(widths))}")
+            print(f"  max fan-out width     : {max(widths)}")
+            print(f"  agents fanned out     : {sum(widths)}")
+            if measurable:
+                print(
+                    f"  est. wall-clock saved : {saved_total} ms "
+                    f"across {measurable} timed batch(es)"
+                )
+                print("    (Σ wall_ms − max wall_ms per batch — time NOT spent serially)")
+            else:
+                print("  est. wall-clock saved : n/a (batches lack wall_ms timing)")
 
     # ── Ask-band overrides ──────────────────────────────────────────────
     overrides = load_jsonl(args.overrides) if args.overrides else []

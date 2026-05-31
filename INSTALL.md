@@ -54,10 +54,10 @@ command -v cc-route && cc-route --help
 
 ## 4 — (Optional) Set ANTHROPIC_API_KEY for the Haiku fallback
 
-Without an API key, ambiguous prompts default to "sonnet at
-confidence 0.5 (ask)". With a key, the router falls back to a Haiku
-call (~500 ms) for borderline cases and emits much sharper
-classifications.
+Without an API key, ambiguous prompts default to "haiku at
+confidence 0.55 (ask)" — cheap-and-confirm. With a key, the router falls
+back to a Haiku classifier call (~1.5 s) for borderline cases and emits
+much sharper classifications.
 
 ```bash
 echo 'export ANTHROPIC_API_KEY=sk-ant-...' >> ~/.zshrc   # or .bashrc
@@ -92,8 +92,12 @@ Example for a CAD / firmware / hard-engineering project:
 {
   "default_model": "opus",
   "rules": [
-    {"match": "list|status|find", "regex": true, "model": "haiku",
-     "reason": "trivial lookups still don't need opus"}
+    {
+      "match": "list|status|find",
+      "regex": true,
+      "model": "haiku",
+      "reason": "trivial lookups still don't need opus"
+    }
   ]
 }
 ```

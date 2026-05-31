@@ -11,6 +11,16 @@ you launched with and dispatches real work to a model-matched worker
 subagent. New sessions can be launched on the right model from the
 start via the bundled `cc-route` CLI wrapper.
 
+**Parallel by default where it's safe.** Multi-part prompts and plan-mode
+steps follow one spine — **decompose → cheapest sufficient model per task →
+run independent pieces in parallel → synthesize**. That's faster
+(wall-clock), cheaper (many small Haiku/Sonnet contexts beat one giant
+Opus-rate context), and higher quality (a dedicated synthesis pass). Agents
+only run concurrently when they can't collide: read-only tasks are always
+safe, writers run together only when their file sets are **disjoint**, and
+overlapping writers are serialized (or isolated in a git worktree). See
+[Plan-mode behaviour](#plan-mode-behaviour).
+
 ## Install
 
 See [INSTALL.md](INSTALL.md). TL;DR:
@@ -35,13 +45,18 @@ prompt → UserPromptSubmit hook
          ↓
 parent session reads block, auto-model-routing skill fires
          ↓
+         band=auto + fanout → Branch E: decompose → parallel batch of agents
          band=auto  → Agent(subagent_type="router-{model}", prompt=…)
-         band=ask   → AskUserQuestion chip, then dispatch
+         band=ask   → AskUserQuestion chip, then dispatch (or fan out)
          band=none  → ignore, do inline
-         plan_mode  → plan-with-models skill enforces Model: tags on every step
+         IN PLAN MODE (parent-detected) → plan-with-models runs parallel waves
          ↓
-         worker returns → parent relays 1-2 sentence summary → audit log
+         worker(s) return → parent synthesizes 1-2 sentence summary → audit log
 ```
+
+Plan mode is **parent-authoritative**: the `UserPromptSubmit` hook can't see
+plan state (the payload has no plan flag), so the parent decides from its own
+context and the `plan_mode` field in the decision block is best-effort only.
 
 ## Components
 
@@ -51,18 +66,27 @@ auto-model-router/
 │   ├── marketplace.json     # single-plugin marketplace manifest
 │   └── plugin.json          # plugin metadata
 ├── hooks/
-│   ├── auto-router.py       # UserPromptSubmit hook — the classifier
+│   ├── auto-router.py       # UserPromptSubmit hook — the classifier (+ fanout)
+│   ├── post-agent-audit.py  # PostToolUse — outcome capture (tokens, wall, group)
+│   ├── pre-agent-mark.py    # PreToolUse — start-time marker for wall-clock
+│   ├── waves.py             # pure DAG→waves + non-interference batching
 │   └── hooks.json           # hook registration (auto-loaded by Claude Code)
 ├── skills/
-│   ├── auto-model-routing/SKILL.md   # parent: read decision → delegate
-│   └── plan-with-models/SKILL.md     # plan-mode: per-step Model:/Effort: tags
+│   ├── auto-model-routing/SKILL.md   # parent: read decision → delegate / fan out
+│   └── plan-with-models/SKILL.md     # plan-mode: tags + parallel wave executor
 ├── agents/
 │   ├── router-haiku.md      # worker subagent_type, model=haiku
 │   ├── router-sonnet.md     # worker subagent_type, model=sonnet
 │   └── router-opus.md       # worker subagent_type, model=opus
 ├── commands/
 │   ├── route.md             # /route <prompt>  — force re-classify
-│   └── route-status.md      # /route-status   — recent decisions
+│   └── route-status.md      # /route-status   — recent decisions + parallelism
+├── tools/
+│   └── analyze-audit.py     # distribution + parallelism analyzer
+├── tests/
+│   ├── fixtures.jsonl       # golden classifier cases (+ fanout)
+│   ├── run.sh               # classifier fixture harness
+│   └── test_waves.py        # wave/non-interference unit tests
 ├── bin/
 │   ├── cc-route             # CLI wrapper for session-launch routing
 │   └── install.sh           # post-install: symlink cc-route to PATH
@@ -77,25 +101,25 @@ No manual `settings.json` edit needed.
 
 ## Confidence bands
 
-- **`auto` (≥ 0.80)**: parent auto-dispatches via `Agent` and reports the
+- **`auto` (≥ 0.90)**: parent auto-dispatches via `Agent` and reports the
   worker's result. No interactive step.
-- **`ask` (0.50–0.80)**: parent calls `AskUserQuestion` with options
+- **`ask` (0.60–0.90)**: parent calls `AskUserQuestion` with options
   `[Use <model>] [Use Opus] [Stay on current]`. Honours your answer.
-- **`none` (< 0.50)**: silent. Hook emits an audit log entry but
+- **`none` (< 0.60)**: silent. Hook emits an audit log entry but
   injects no context.
 
 ## Knobs
 
-| Mechanism | Effect |
-|---|---|
-| `#noshift` in the prompt | Skip routing entirely for this prompt. |
-| `#noroute` in the prompt | Alias for `#noshift`. |
-| `#model=opus` (or sonnet/haiku) | Force-route to that tier; confidence 1.0, band=auto. |
-| Env `CC_ROUTER_DISABLE=1` | Disable the hook globally for the shell. |
-| Env `CC_ROUTER_AUTO_THRESHOLD=0.9` | Raise/lower the auto-delegate cutoff (default 0.80). |
-| Env `CC_ROUTER_ASK_THRESHOLD=0.6` | Raise/lower the ask cutoff (default 0.50). |
-| Env `ANTHROPIC_API_KEY` | Enables the Haiku fallback classifier for ambiguous cases. Without it, low-confidence prompts default to Sonnet/ask. |
-| Project `.claude/router.json` | Per-project overrides (see below). Found by walking up from `cwd`. |
+| Mechanism                          | Effect                                                                                                               |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `#noshift` in the prompt           | Skip routing entirely for this prompt.                                                                               |
+| `#noroute` in the prompt           | Alias for `#noshift`.                                                                                                |
+| `#model=opus` (or sonnet/haiku)    | Force-route to that tier; confidence 1.0, band=auto.                                                                 |
+| Env `CC_ROUTER_DISABLE=1`          | Disable the hook globally for the shell.                                                                             |
+| Env `CC_ROUTER_AUTO_THRESHOLD=0.9` | Raise/lower the auto-delegate cutoff (default 0.90).                                                                 |
+| Env `CC_ROUTER_ASK_THRESHOLD=0.6`  | Raise/lower the ask cutoff (default 0.60).                                                                           |
+| Env `ANTHROPIC_API_KEY`            | Enables the Haiku fallback classifier for ambiguous cases. Without it, low-confidence prompts default to Sonnet/ask. |
+| Project `.claude/router.json`      | Per-project overrides (see below). Found by walking up from `cwd`.                                                   |
 
 ### Per-project overrides — `.claude/router.json`
 
@@ -104,24 +128,25 @@ that tree. Keys (all optional):
 
 ```jsonc
 {
-  "disabled": false,              // turn off routing for this project entirely
-  "default_model": "opus",        // pin every prompt; confidence 0.95, band=auto
-  "auto_threshold": 0.85,         // override the global auto cutoff
-  "ask_threshold": 0.6,           // override the global ask cutoff
-  "rules": [                      // first match wins, checked before heuristics
+  "disabled": false, // turn off routing for this project entirely
+  "default_model": "opus", // pin every prompt; confidence 0.95, band=auto
+  "auto_threshold": 0.85, // override the global auto cutoff
+  "ask_threshold": 0.6, // override the global ask cutoff
+  "rules": [
+    // first match wins, checked before heuristics
     {
-      "match": "design|asset|mascot|logo",   // regex (because "regex": true)
+      "match": "design|asset|mascot|logo", // regex (because "regex": true)
       "regex": true,
       "model": "sonnet",
-      "reason": "design/asset work — Sonnet is plenty"
+      "reason": "design/asset work — Sonnet is plenty",
     },
     {
       "match": "cad|firmware|geometry",
       "regex": true,
       "model": "opus",
-      "reason": "engineering / hard reasoning — keep Opus"
-    }
-  ]
+      "reason": "engineering / hard reasoning — keep Opus",
+    },
+  ],
 }
 ```
 
@@ -132,8 +157,8 @@ Common patterns to start from:
   rule for trivial lookups.
 - **Design / asset / content project**: `{"default_model": "sonnet"}`.
 - **SaaS feature work / spec writing**: `{"default_model": "sonnet",
-  "rules": [{"match": "refactor.*architecture", "regex": true,
-  "model": "opus"}]}`.
+"rules": [{"match": "refactor.*architecture", "regex": true,
+"model": "opus"}]}`.
 - **Docs-only project**: `{"default_model": "sonnet"}` or even
   `{"default_model": "haiku"}` if the writes are mostly mechanical.
 
@@ -201,12 +226,29 @@ the distribution. Common targets after a few weeks of use:
 
 ## Plan-mode behaviour
 
-When plan mode is active, the hook detects it and injects a different
-instruction telling the planner to tag every step with `Model:` and
-`Effort:`. The `plan-with-models` skill carries the canonical template.
-On execution (e.g. via `superpowers:executing-plans`), each tagged step
-is dispatched as `Agent(subagent_type="router-<model>", …)` —
-heterogeneous plans naturally.
+Plan mode is **parent-authoritative** — the parent recognizes it from its
+own context, not the hook (the `UserPromptSubmit` payload carries no
+plan-mode flag, so the decision block's `plan_mode` is best-effort and is
+usually `false` even mid-plan). When in plan mode, the parent uses the
+`plan-with-models` skill, which:
+
+1. requires every step to carry `Model:`, `Effort:`, and `Files:` tags;
+2. builds a dependency DAG from `Depends on:` and groups steps into
+   **waves**;
+3. within each wave, runs steps **concurrently** when their write-`Files:`
+   sets are disjoint (read-only steps are always safe), dispatching each
+   conflict-free batch as one message of parallel
+   `Agent(subagent_type="router-<model>", …)` calls;
+4. serializes overlapping writers (or isolates them in a worktree), then
+   synthesizes + verifies after each wave.
+
+`plan-with-models` **owns execution** — it does not hand off to
+`subagent-driven-development`, which runs steps strictly sequentially. For
+very large plans it can emit a `Workflow` script instead (opt-in).
+
+Outside plan mode, an unmistakably multi-part prompt (numbered list,
+"X and Y and Z", "for each…") is flagged `fanout` by the hook and handled by
+**Branch E** of `auto-model-routing` with the same non-interference rules.
 
 ## Retry / escalation policy
 
@@ -269,13 +311,21 @@ don't do any of this.
   pattern works around this by keeping the parent on whatever model
   you launched with and delegating the real work elsewhere.
 - **Classification is heuristic-first.** Without `ANTHROPIC_API_KEY`,
-  ambiguous prompts fall back to "default Sonnet at confidence 0.5"
-  (which lands in `ask` band — you'll be prompted). With a key, the
-  Haiku fallback fires within ~500 ms.
+  ambiguous prompts fall back to "default Haiku at confidence 0.55"
+  (which lands in `ask` band — you'll be prompted, cheap-and-confirm).
+  With a key, the Haiku fallback classifier fires within ~1.5 s.
 - **Subagents don't inherit your live conversation context** — only
   your project's CLAUDE.md/AGENTS.md, working directory, and the
   prompt the parent passes. For deeply iterative sub-tasks (5+
   back-and-forths on the same thread) you'll want to stay inline.
+- **Non-interference relies on declared `Files:`.** Parallel safety is
+  proven from each step's declared write set. A step that writes a file
+  it didn't declare can collide with a concurrent sibling — which is why
+  the wave executor treats unlabelled writers as a bug and constrains
+  each agent to its `Files:` in the prompt. When in doubt it serializes.
+- **Plan mode is parent-detected, not hook-detected.** The hook never
+  sees plan state, so plan-mode routing depends on the parent honoring
+  its own context (the `auto-model-routing` skill instructs this).
 
 ## Contributing
 
@@ -283,10 +333,9 @@ Issues and PRs welcome on the repo's GitHub page. Common areas to
 improve:
 
 - Heuristic regex tuning (lots of false-negatives possible for niche
-  task verbs).
-- Plan-mode marker detection (currently looks for system-reminder
-  text — should switch to a structured payload field when Claude Code
-  exposes one).
+  task verbs) — including the `fanout` decomposition patterns.
+- A learned decomposer for Branch E fan-out (today it's heuristic; the
+  captured `group_id` + outcome data is the dataset for training one).
 - A streaming dispatch mode so workers' partial output can flow to
   the parent in real time (Claude Code limitation today).
 

@@ -19,21 +19,36 @@ your injected context. Honour it before doing any work.
   "tier": "trivial" | "standard" | "complex" | "deep" | "override",
   "confidence": 0.0-1.0,
   "reason": "one-sentence justification",
-  "source": "heuristic" | "haiku" | "default" | "override",
+  "source": "heuristic" | "haiku" | "default" | "override" | "project_config",
   "plan_mode": true | false,
+  "fanout": true | false,
+  "fanout_hint": 3,
   "decision_id": "r_xxxxxxxxxx",
-  "thresholds": {"auto": 0.80, "ask": 0.50}
+  "thresholds": {"auto": 0.90, "ask": 0.60}
 }
 ```
+
+`fanout` (with `fanout_hint` ≈ subtask count) means the hook detected a
+**decomposable** prompt — multiple independent asks. Handle it with Branch E.
+`plan_mode` is **best-effort and usually `false`** — the hook can't see plan
+mode reliably. Trust your own context over this field (see Procedure).
 
 ## Procedure
 
 ```
-band == "auto" → DELEGATE
-band == "ask"  → CONFIRM, then DELEGATE
-band == "none" → IGNORE (do the work yourself)
-plan_mode == true → don't delegate; invoke `plan-with-models` skill instead
+IN PLAN MODE?  → don't delegate; use `plan-with-models` (see below) — FIRST CHECK
+band == "auto" + fanout → Branch E: decompose + parallel dispatch
+band == "auto" → Branch A: DELEGATE to one worker
+band == "ask"  → Branch B: CONFIRM, then delegate (or fan out)
+band == "none" → Branch C: IGNORE (do the work yourself)
 ```
+
+**Plan mode is parent-authoritative.** Check it FIRST, before reading the
+band. If a system reminder in your context says plan mode is active, route to
+`plan-with-models` regardless of the `plan_mode` field in the decision block —
+that field is best-effort and is almost always `false` even when you ARE in
+plan mode (the hook can't see plan state). Do not trust it; trust your own
+context.
 
 ### Branch A — `band == "auto"`
 
@@ -44,7 +59,9 @@ plan_mode == true → don't delegate; invoke `plan-with-models` skill instead
      supplied in this turn (file paths they referenced, follow-up
      details from earlier turns, etc.). Frame it so the agent can act
      cold.
-2. While the agent runs, do not start parallel work on the same task.
+2. While the agent runs, don't duplicate work on the **same** subtask. (You
+   **may** fan out across **independent** subtasks — that's Branch E, not a
+   violation of this rule.)
 3. When it returns, relay its result to the user in **1–2 sentences**
    (plus any direct artifact URLs). Do not paraphrase its entire output.
 4. Append an outcome line to the audit log:
@@ -90,11 +107,48 @@ plan_mode == true → don't delegate; invoke `plan-with-models` skill instead
 
 Proceed normally. Do the work yourself on the current session model.
 
-### Branch D — `plan_mode == true`
+### Branch D — plan mode (parent-authoritative)
 
-Invoke the `plan-with-models` skill and let it own the plan structure.
-Do not delegate the _planning_ itself — planning is the parent's job;
-heterogeneous _execution_ happens when the plan is later run.
+If you are in plan mode (your context says so — don't rely on the
+`plan_mode` field), invoke the `plan-with-models` skill and let it own the
+plan structure. Do not delegate the _planning_ itself — planning is the
+parent's job. `plan-with-models` then executes the plan as **parallel
+waves** (independent steps run concurrently; see that skill's wave
+procedure). This is where the user's "create the respective agents for
+specific tasks" happens: each plan step becomes a `router-<model>` agent,
+and disjoint-file steps in the same wave fire together.
+
+### Branch E — `band == "auto"` (or "ask") **and** `fanout == true`
+
+The prompt decomposes into independent subtasks (numbered list, "X and Y
+and Z", "for each…"). Fan out instead of doing them serially:
+
+1. **Decompose** the prompt into the smallest independent subtasks
+   (the `fanout_hint` is the rough count). For each, name the files it will
+   **write** (if any).
+2. **Classify each subtask** to the cheapest sufficient model — most list
+   items are `router-haiku` (a read, a one-file edit) or `router-sonnet`;
+   reserve `router-opus` for the genuinely hard one. This is the
+   token-efficiency win: small focused contexts at low tiers beat one big
+   Opus context doing everything.
+3. **Check non-interference** (same rule as `plan-with-models`, single
+   source of truth):
+   - Read-only subtasks → always safe to run together.
+   - Writers → together only if their write-file sets are **disjoint**.
+   - Overlapping writers → run in separate messages (serialize), or
+     `isolation: "worktree"` + merge if they must be concurrent.
+4. **Dispatch each conflict-free batch as ONE message** of multiple
+   `Agent()` calls (the harness runs them concurrently). Prefix each
+   `description` with `[grp:<id>]` (shared per batch) so outcome capture can
+   measure the fan-out.
+5. **Synthesize**: when the batch returns, integrate the results and report
+   to the user in **1–2 sentences** total — not one summary per agent.
+6. If `band == "ask"`, do Branch B's confirmation first, then fan out.
+
+When **not** to fan out: the subtasks actually depend on each other
+sequentially; or there's really just one task dressed up with conjunctions
+("read the file **and** tell me what it does" is one task). When in doubt
+on a borderline case, prefer a single dispatch.
 
 ## When to override the router
 

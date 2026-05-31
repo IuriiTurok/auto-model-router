@@ -37,6 +37,7 @@ while IFS= read -r fixture; do
   expect_effort=$(printf '%s' "$fixture" | jq -r '.expect.effort // ""')
   expect_band=$(printf '%s' "$fixture" | jq -r '.expect.band // ""')
   expect_conf_min=$(printf '%s' "$fixture" | jq -r '.expect.conf_min // 0')
+  expect_fanout=$(printf '%s' "$fixture" | jq -r 'if .expect|has("fanout") then (.expect.fanout|tostring) else "" end')
 
   decision=$(printf '%s' "$fixture" \
     | jq -c '{prompt: .prompt, cwd: "/tmp"}' \
@@ -55,8 +56,10 @@ print(ctx[start:end])
   got_effort=$(printf '%s' "$decision" | jq -r .effort)
   got_band=$(printf '%s' "$decision" | jq -r .band)
   got_conf=$(printf '%s' "$decision" | jq -r .confidence)
+  got_fanout=$(printf '%s' "$decision" | jq -r '.fanout // false | tostring')
 
   errors=""
+  [ -n "$expect_fanout" ] && [ "$got_fanout" != "$expect_fanout" ] && errors="$errors fanout=$got_fanout(want $expect_fanout)"
   [ -n "$expect_tier" ] && [ "$got_tier" != "$expect_tier" ] && errors="$errors tier=$got_tier(want $expect_tier)"
   [ -n "$expect_model" ] && [ "$got_model" != "$expect_model" ] && errors="$errors model=$got_model(want $expect_model)"
   [ -n "$expect_effort" ] && [ "$got_effort" != "$expect_effort" ] && errors="$errors effort=$got_effort(want $expect_effort)"
