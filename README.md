@@ -78,6 +78,17 @@ with `--json` for machine output); correction detection is heuristic unless
 `--llm-judge` adds a Haiku pass. All figures are estimates and the
 router-vs-inline timing comparison is correlation, not causation.
 
+`/router-loop` is the autonomous closed-loop counterpart to `/router-report`:
+where the report **offers** tweaks for you to apply by hand, the loop runs a
+PROPOSE → COMMIT → EXECUTE → EVALUATE → DECIDE cycle that proposes **one**
+`auto_threshold` step, gates it offline (fixtures + a projected-band sanity
+check), applies it to a **loop-private git repo** (`router-loop/auto`, never
+pushed), then confirms-or-reverts it against realized KPIs — with **quality**
+(`GOALS.md` §2) as the hard veto and `git revert` as the rollback. It is
+rung-2, config-only (the global `auto_threshold`), and self-rolling-back; the
+report's "offer, don't apply" contract is untouched. See `tools/router_loop.py`
+and `GOALS.md`.
+
 ## Components
 
 ```
