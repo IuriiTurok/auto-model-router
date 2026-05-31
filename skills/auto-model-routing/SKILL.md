@@ -69,7 +69,22 @@ plan_mode == true → don't delegate; invoke `plan-with-models` skill instead
      - `Stay on current` — handle the prompt inline on the current
        session model.
 2. Wait for the answer, then execute the chosen branch.
-3. Audit-log the outcome with `outcome: "user_<answer>"`.
+3. **Log the user's choice** before doing the work, so the router has
+   the labeled training data it needs to tighten heuristics later.
+   Append one JSON line to `~/.claude/cache/router/overrides.jsonl`
+   using a single Bash call:
+
+   ```bash
+   python3 -c "import json,sys,os,datetime; \
+   p=os.path.expanduser('~/.claude/cache/router/overrides.jsonl'); \
+   os.makedirs(os.path.dirname(p), exist_ok=True); \
+   open(p,'a').write(json.dumps({'ts':datetime.datetime.now(datetime.timezone.utc).isoformat(),'decision_id':'<DECISION_ID>','suggested':'<SUGGESTED_MODEL>','user_choice':'<USER_CHOICE>'})+'\n')"
+   ```
+
+   Substitute the `decision_id` from the `<router-decision>` block, the
+   suggested model the router proposed, and one of `use_suggested`,
+   `use_opus`, or `stay_inline` for the user's pick. Never block on
+   this — if the write fails, proceed with the work anyway.
 
 ### Branch C — `band == "none"` or no decision block
 
@@ -78,8 +93,8 @@ Proceed normally. Do the work yourself on the current session model.
 ### Branch D — `plan_mode == true`
 
 Invoke the `plan-with-models` skill and let it own the plan structure.
-Do not delegate the *planning* itself — planning is the parent's job;
-heterogeneous *execution* happens when the plan is later run.
+Do not delegate the _planning_ itself — planning is the parent's job;
+heterogeneous _execution_ happens when the plan is later run.
 
 ## When to override the router
 
@@ -118,7 +133,7 @@ Each worker subagent ends its turn with one of these markers:
 - `Done: …` — success; relay and stop.
 - `Done with caveats: …` — success with a flagged concern; relay both.
 - `Stopped: too complex for <model> tier. Reason: <why>. Suggest re-
-  dispatch to router-<higher>.` — explicit escalation.
+dispatch to router-<higher>.` — explicit escalation.
 
 When you see `Stopped:`, **don't ask the user**; just re-dispatch one
 tier up (`router-haiku` → `router-sonnet` → `router-opus`). Pass the
@@ -160,11 +175,11 @@ the project's `default_model` or add a `rules:` entry in
 
 Each tier maps to a pre-registered subagent type:
 
-| Model | subagent_type | Use for |
-|---|---|---|
-| haiku | `router-haiku` | Reads, lists, lookups, quick edits, classifications |
-| sonnet | `router-sonnet` | Routine refactors, doc writing, spec edits, prototype iteration |
-| opus | `router-opus` | Deep refactors, architecture, hard debugging, multi-file synthesis |
+| Model  | subagent_type   | Use for                                                            |
+| ------ | --------------- | ------------------------------------------------------------------ |
+| haiku  | `router-haiku`  | Reads, lists, lookups, quick edits, classifications                |
+| sonnet | `router-sonnet` | Routine refactors, doc writing, spec edits, prototype iteration    |
+| opus   | `router-opus`   | Deep refactors, architecture, hard debugging, multi-file synthesis |
 
 The dispatched agent inherits the parent's working directory and
 project-level `CLAUDE.md` / `AGENTS.md` instructions.

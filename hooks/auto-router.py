@@ -9,9 +9,11 @@ Behaviour:
   - Results cached by SHA256(prompt) for 7 days under
     ~/.claude/cache/router/.
   - Confidence bands -> band field:
-      auto   if confidence >= AUTO_THRESHOLD  (default 0.80)
-      ask    if AUTO_THRESHOLD > confidence >= ASK_THRESHOLD  (default 0.50)
+      auto   if confidence >= AUTO_THRESHOLD  (default 0.90)
+      ask    if AUTO_THRESHOLD > confidence >= ASK_THRESHOLD  (default 0.60)
       none   otherwise (silent)
+  - Effort (low/medium/high/xhigh) is scored independently from tier; when
+    they disagree, confidence is capped to push the decision into ask band.
   - Plan-mode detection from payload markers; emits a different message
     instructing the planner to annotate steps with Model:/Effort: tags.
   - Audit-logs every fired decision to ~/.claude/cache/router/audit.jsonl.
@@ -38,10 +40,14 @@ from datetime import datetime, timezone
 CACHE_DIR = os.path.expanduser("~/.claude/cache/router")
 AUDIT_LOG = os.path.join(CACHE_DIR, "audit.jsonl")
 CACHE_TTL_SEC = 7 * 86400
-HAIKU_TIMEOUT_SEC = 0.5
+HAIKU_TIMEOUT_SEC = 1.5
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 MAX_PROMPT_CHARS_TO_API = 2000
 PROJECT_CONFIG_FILENAME = ".claude/router.json"
+
+# Bumped whenever classifier output or thresholds change; cache_get treats
+# entries with a different version as a miss so old entries naturally expire.
+CLASSIFIER_VERSION = 3
 
 # Audit log rotation
 AUDIT_ROTATE_BYTES = int(
@@ -49,8 +55,8 @@ AUDIT_ROTATE_BYTES = int(
 )
 AUDIT_RETAIN_DAYS = int(os.environ.get("CC_ROUTER_AUDIT_RETAIN_DAYS", "30"))
 
-DEFAULT_AUTO_THRESHOLD = float(os.environ.get("CC_ROUTER_AUTO_THRESHOLD", "0.80"))
-DEFAULT_ASK_THRESHOLD = float(os.environ.get("CC_ROUTER_ASK_THRESHOLD", "0.50"))
+DEFAULT_AUTO_THRESHOLD = float(os.environ.get("CC_ROUTER_AUTO_THRESHOLD", "0.90"))
+DEFAULT_ASK_THRESHOLD = float(os.environ.get("CC_ROUTER_ASK_THRESHOLD", "0.60"))
 
 
 def load_project_config(start_dir: str | None = None) -> dict:
@@ -133,6 +139,17 @@ DEEP_VERBS = re.compile(
     re.I,
 )
 OVERRIDE_PATTERN = re.compile(r"#model=(haiku|sonnet|opus)\b", re.I)
+FILE_PATH = re.compile(
+    r"(?<![:\w])(?:~|\.{0,2}/)[\w./~-]+|\b[\w-]+\.(?:py|ts|tsx|js|jsx|md|json|yaml|yml|sh|rs|go|java|cpp|c|h)\b"
+)
+EFFORT_HEAVY_VERBS = re.compile(
+    r"\b(refactor|migrate|investigate|audit|architect|integrate|restructure|"
+    r"optimi[sz]e|across|consolidate|review|rewrite|redesign|implement|"
+    r"port|extract|build)\b",
+    re.I,
+)
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh")
+TEST_VERIFY = re.compile(r"\b(test|tests|verify|verification|spec|specs)\b", re.I)
 
 
 def classify_heuristic(prompt: str) -> dict | None:
@@ -141,22 +158,27 @@ def classify_heuristic(prompt: str) -> dict | None:
     chars = len(prompt)
     lines = prompt.count("\n") + 1
     has_code = "```" in prompt
+    has_path = bool(FILE_PATH.search(prompt))
     nontrivial = words > 12 or has_code or lines > 3
 
     if DEEP_VERBS.search(lower):
+        # Long, file-anchored design/audit requests are highest-signal opus work.
+        conf = 0.95 if words > 25 and has_path else 0.85
         return {
             "tier": "deep",
             "model": "opus",
             "effort": "xhigh",
-            "confidence": 0.85,
+            "confidence": conf,
             "source": "heuristic",
             "reasoning": "explicit design/plan/investigate intent",
         }
     if COMPLEX_VERBS.search(lower):
-        # Complex verbs strongly imply non-trivial scope on their own.
-        # Calibrate confidence by length so a 5-word "refactor X" doesn't
-        # auto-route as confidently as a paragraph-long refactor request.
-        conf = 0.85 if nontrivial else 0.75
+        if has_code:
+            conf = 0.92
+        elif nontrivial:
+            conf = 0.85
+        else:
+            conf = 0.75
         return {
             "tier": "complex",
             "model": "opus",
@@ -172,11 +194,13 @@ def classify_heuristic(prompt: str) -> dict | None:
         and lines <= 2
         and LOOKUP_VERBS.match(lower)
     ):
+        # A trailing "?" on a short lookup is the clearest possible Haiku signal.
+        conf = 0.95 if prompt.rstrip().endswith("?") else 0.90
         return {
             "tier": "trivial",
             "model": "haiku",
             "effort": "low",
-            "confidence": 0.9,
+            "confidence": conf,
             "source": "heuristic",
             "reasoning": "short lookup phrasing",
         }
@@ -191,6 +215,67 @@ def classify_heuristic(prompt: str) -> dict | None:
             "reasoning": "moderate scope, no complex signals",
         }
     return None
+
+
+def score_effort(prompt: str) -> tuple[str, float, str]:
+    """Independent effort assessment from work-shape signals.
+
+    Returns (effort_level, confidence, reason). Used after tier classification
+    so model and effort can disagree — that disagreement caps confidence and
+    drops the decision into the `ask` band for a human to break the tie.
+    """
+    lower = prompt.lower()
+    words = len(prompt.split())
+    lines = prompt.count("\n") + 1
+    has_code = "```" in prompt
+    paths = len(FILE_PATH.findall(prompt))
+
+    score = 0
+    if has_code:
+        score += 2
+    if paths >= 3:
+        score += 2
+    elif paths >= 1:
+        score += 1
+    if EFFORT_HEAVY_VERBS.search(lower):
+        score += 2
+    if words > 80:
+        score += 1
+    if lines > 6:
+        score += 1
+    if TEST_VERIFY.search(lower):
+        score += 1
+    if words < 10 and prompt.rstrip().endswith("?"):
+        score -= 1
+
+    # Confidence is highest when score is comfortably inside a bucket and
+    # drops near the boundaries so disagreements with tier cap correctly.
+    if score <= 0:
+        return "low", 0.95, f"effort_score={score} (clearly light)"
+    if score == 1:
+        return "low", 0.85, f"effort_score={score} (light)"
+    if score == 2:
+        return "medium", 0.80, f"effort_score={score} (near low/medium boundary)"
+    if score == 3:
+        return "medium", 0.90, f"effort_score={score} (clearly medium)"
+    if score == 4:
+        return "high", 0.85, f"effort_score={score} (heavy)"
+    if score == 5:
+        return "high", 0.80, f"effort_score={score} (near high/xhigh boundary)"
+    return "xhigh", 0.95, f"effort_score={score} (very heavy)"
+
+
+def _project_default_result(project_cfg: dict, why: str) -> dict:
+    pinned = project_cfg["default_model"]
+    effort_map = {"haiku": "low", "sonnet": "medium", "opus": "high"}
+    return {
+        "tier": "project_default",
+        "model": pinned,
+        "effort": effort_map.get(pinned, "medium"),
+        "confidence": 0.85,
+        "source": "project_config",
+        "reasoning": f"project default {pinned} ({why})",
+    }
 
 
 def classify_haiku(prompt: str) -> dict | None:
@@ -241,7 +326,10 @@ def cache_get(prompt: str) -> dict | None:
         if time.time() - os.stat(path).st_mtime > CACHE_TTL_SEC:
             return None
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
+        if data.get("classifier_version") != CLASSIFIER_VERSION:
+            return None
+        return data
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
 
@@ -251,7 +339,7 @@ def cache_put(prompt: str, result: dict) -> None:
         os.makedirs(CACHE_DIR, exist_ok=True)
         h = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         with open(os.path.join(CACHE_DIR, f"{h}.json"), "w") as f:
-            json.dump(result, f)
+            json.dump({**result, "classifier_version": CLASSIFIER_VERSION}, f)
     except OSError:
         pass
 
@@ -267,23 +355,25 @@ def band_for(confidence: float, auto_threshold: float, ask_threshold: float) -> 
 def detect_plan_mode(payload: dict) -> bool:
     """Best-effort plan-mode detection from hook payload.
 
-    Claude Code surfaces plan mode via system-reminder text in the
-    transcript context. The hook only sees the prompt and a few payload
-    fields; we look at any embedded markers conservatively.
+    Prefer a structured `plan_mode` field if Claude Code provides one;
+    fall back to text markers in the JSON payload otherwise. The text
+    fallback exists because earlier Claude Code releases only surface
+    plan mode via system-reminder strings in the transcript context.
     """
+    if payload.get("plan_mode") is True:
+        return True
     raw = json.dumps(payload).lower()
-    return (
-        "plan mode is active" in raw
-        or "exitplanmode" in raw
-        or payload.get("plan_mode") is True
-    )
+    return "plan mode is active" in raw or "exitplanmode" in raw
 
 
 def audit_rotate_if_needed() -> None:
     """Rotate audit.jsonl when it exceeds AUDIT_ROTATE_BYTES; prune rotated
     files older than AUDIT_RETAIN_DAYS. Silent on failure."""
     try:
-        if os.path.exists(AUDIT_LOG) and os.path.getsize(AUDIT_LOG) >= AUDIT_ROTATE_BYTES:
+        if (
+            os.path.exists(AUDIT_LOG)
+            and os.path.getsize(AUDIT_LOG) >= AUDIT_ROTATE_BYTES
+        ):
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             os.rename(AUDIT_LOG, f"{AUDIT_LOG}.{stamp}")
         cutoff = time.time() - AUDIT_RETAIN_DAYS * 86400
@@ -344,37 +434,70 @@ def main() -> int:
             "reasoning": f"user override #model={forced}",
         }
     else:
-        # Project rules take precedence over heuristics but not over user overrides.
+        # Order: project_rule (explicit pattern) → cache → heuristic → Haiku
+        # API → project_default (as bias on ambiguous standard, or as final
+        # fallback) → cheap-and-ask. project_default is no longer a hard
+        # short-circuit, which is what restores Haiku to its proper share
+        # of trivial reads in projects with a sonnet default.
         result = apply_project_rules(prompt, project_cfg)
-        if result is None and project_cfg.get("default_model"):
-            pinned = project_cfg["default_model"]
-            effort_map = {"haiku": "low", "sonnet": "medium", "opus": "high"}
-            result = {
-                "tier": "project_default",
-                "model": pinned,
-                "effort": effort_map.get(pinned, "medium"),
-                "confidence": 0.95,
-                "source": "project_config",
-                "reasoning": f"project default_model={pinned} from {project_cfg.get('_source', '')}",
-            }
         if result is None:
-            result = cache_get(prompt)
-            if result is None:
+            cached = cache_get(prompt)
+            if cached is not None:
+                result = cached
+            else:
                 result = classify_heuristic(prompt)
                 if result is None or result.get("confidence", 0) < 0.7:
                     haiku = classify_haiku(prompt)
                     if haiku is not None:
                         result = haiku
+                if (
+                    result is not None
+                    and result.get("tier") == "standard"
+                    and result.get("confidence", 1.0) < 0.80
+                    and project_cfg.get("default_model")
+                ):
+                    result = _project_default_result(
+                        project_cfg,
+                        f"bias on ambiguous standard: {result.get('reasoning', '')}",
+                    )
                 if result is None:
-                    result = {
-                        "tier": "standard",
-                        "model": "sonnet",
-                        "effort": "medium",
-                        "confidence": 0.5,
-                        "source": "default",
-                        "reasoning": "no heuristic match; Haiku unavailable or timed out",
-                    }
+                    if project_cfg.get("default_model"):
+                        result = _project_default_result(
+                            project_cfg, "no heuristic match"
+                        )
+                    else:
+                        result = {
+                            "tier": "trivial",
+                            "model": "haiku",
+                            "effort": "low",
+                            "confidence": 0.55,
+                            "source": "default",
+                            "reasoning": "no heuristic match; default cheap, ask user",
+                        }
                 cache_put(prompt, result)
+
+    # Independent effort score: tier picks the model; effort comes from
+    # work-shape signals. Adjacent disagreement (gap=1, e.g. tier wants
+    # high but scorer says medium) is normal calibration — accept the
+    # scored effort and keep the tier's confidence. Large disagreement
+    # (gap>=2, e.g. tier wants xhigh but scorer says low) is a real
+    # ambiguity signal — cap confidence so the decision drops into ask.
+    if result.get("tier") not in ("override", "project_rule"):
+        tier_effort = result.get("effort")
+        scored_effort, effort_conf, effort_reason = score_effort(prompt)
+        result["effort"] = scored_effort
+        try:
+            gap = abs(
+                EFFORT_LEVELS.index(scored_effort) - EFFORT_LEVELS.index(tier_effort)
+            )
+        except ValueError:
+            gap = 0
+        if gap >= 2:
+            result["confidence"] = min(float(result.get("confidence", 0.5)), 0.85)
+            result["reasoning"] = (
+                f"{result.get('reasoning', '')}; effort "
+                f"{tier_effort}->{scored_effort}: {effort_reason}"
+            )
 
     plan_mode = detect_plan_mode(payload)
     band = band_for(float(result.get("confidence", 0)), auto_threshold, ask_threshold)
