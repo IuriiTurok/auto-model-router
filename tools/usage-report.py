@@ -280,6 +280,23 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None) -> dict:
     }
 
 
+# Inline-skip outcome vocabulary. The canonical set is the skill's mandated
+# spelling; aliases are drifted spellings seen in the wild that the analyzers
+# used to drop — fold them into `inline_other` so they're counted, not lost.
+CANONICAL_SKIPS = {
+    "same_model_inline",
+    "continuity_inline",
+    "skipped_trivial",
+    "worker_failed",
+}
+SKIP_ALIASES = {
+    "inline_override": "inline_other",
+    "override_inline": "inline_other",
+    "stayed_inline": "inline_other",
+    "inline": "inline_other",
+}
+
+
 def analyze_audit(days: int) -> dict:
     """Band/source/model distribution + parallelism from the router's own log.
 
@@ -302,6 +319,10 @@ def analyze_audit(days: int) -> dict:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     by_band, by_model = Counter(), Counter()
     outcomes = []
+    auto_ids = set()
+    skip_outcomes = Counter()
+    skip_ids_auto = 0
+    dispatched = 0
     for r in rows:
         ts = parse_ts(r.get("ts"))
         if ts is not None and ts < cutoff:
@@ -309,14 +330,29 @@ def analyze_audit(days: int) -> dict:
         oc = r.get("outcome")
         if oc in ("injected", "silent"):
             d = r.get("decision") or {}
-            by_band[d.get("band", "?")] += 1
+            band = d.get("band", "?")
+            by_band[band] += 1
             by_model[d.get("model", "?")] += 1
             out["decisions"] += 1
+            if band == "auto" and d.get("decision_id"):
+                auto_ids.add(d["decision_id"])
         elif oc in ("delegated", "delegated_failed"):
             outcomes.append(r)
+            dispatched += 1
+        elif oc in CANONICAL_SKIPS or oc in SKIP_ALIASES:
+            skip_outcomes[SKIP_ALIASES.get(oc, oc)] += 1
+            if r.get("decision_id") in auto_ids:
+                skip_ids_auto += 1
 
     out["by_band"] = dict(by_band)
     out["by_model"] = dict(by_model)
+    out["reconciliation"] = {
+        "auto_decisions": len(auto_ids),
+        "dispatched_total": dispatched,
+        "auto_skip_logged": skip_ids_auto,
+        "auto_unlogged": max(0, len(auto_ids) - skip_ids_auto),
+        "skip_outcomes": dict(skip_outcomes),
+    }
 
     spec_path = os.path.join(os.path.dirname(__file__), "analyze-audit.py")
     try:
@@ -345,17 +381,25 @@ def cost_kpi(tokens: dict) -> dict:
     total_in = sum(v["in"] for v in tokens.values())
     total_out = sum(v["out"] for v in tokens.values())
     total_tok = total_in + total_out
-    saved = 0.0
+    offload = 0.0  # savings from families cheaper than baseline (Haiku/Sonnet)
+    premium = 0.0  # extra spend from pricier-than-baseline families (Fable) — not router-attributable
     by_model_pct = {}
     for fam, v in tokens.items():
-        saved += counterfactual_saving(fam, v["in"], v["out"]) if fam in PRICES else 0.0
+        if fam in PRICES:
+            delta = counterfactual_saving(fam, v["in"], v["out"])
+            if delta >= 0:
+                offload += delta
+            else:
+                premium += delta
         share = (v["in"] + v["out"]) / total_tok if total_tok else 0.0
         by_model_pct[fam] = round(100 * share, 1)
     return {
         "tokens_in": total_in,
         "tokens_out": total_out,
         "pct_tokens_by_model": by_model_pct,
-        "est_saved_vs_opus_usd": round(saved, 2),
+        "est_offload_saved_usd": round(offload, 2),
+        "parent_model_premium_usd": round(premium, 2),
+        "est_saved_vs_opus_usd": round(offload + premium, 2),
     }
 
 
@@ -407,6 +451,7 @@ def build_report(data: dict) -> dict:
 # ── Rendering ───────────────────────────────────────────────────────────────
 def render_markdown(rep: dict, today: str) -> str:
     c, q, t, a = rep["cost"], rep["quality"], rep["time"], rep["router_activity"]
+    rc = a.get("reconciliation", {})
     lines = [
         "---",
         f"date: {today}",
@@ -433,8 +478,12 @@ def render_markdown(rep: dict, today: str) -> str:
         "",
         "## GOAL 1 — Cost efficiency",
         "",
-        f"- **Estimated $ saved vs all-Opus: ${c['est_saved_vs_opus_usd']}** "
-        "(counterfactual estimate; mostly from output tokens — see note)",
+        f"- **Cheaper-model offload saved: ${c['est_offload_saved_usd']}** "
+        "(Haiku/Sonnet tokens vs the all-Opus baseline — the router-attributable win)",
+        f"- **Parent-model premium: ${c['parent_model_premium_usd']}** "
+        "(Fable parent-session tokens cost >Opus — a session-model choice, not routing)",
+        f"- Net vs all-Opus: ${c['est_saved_vs_opus_usd']} (offload + premium; "
+        "counterfactual estimate, mostly output tokens — see note)",
         f"- Uncached input: {c['tokens_in']:,} · output: {c['tokens_out']:,} "
         "(cache-read/creation tokens excluded; with prompt caching most input "
         "is cached, so uncached input is small by design)",
@@ -442,6 +491,12 @@ def render_markdown(rep: dict, today: str) -> str:
         "parent session model dominates; the cheaper-model share is the routed slice.",
         f"- Parallelism wall-clock saved: {a['parallel'].get('wall_ms_saved', 0)} ms "
         f"across {a['parallel'].get('batches', 0)} batch(es)",
+        f"- Dispatch reconciliation (auto band): {rc.get('auto_decisions', 0)} decisions → "
+        f"{rc.get('dispatched_total', 0)} dispatched (all bands — delegated rows carry no "
+        f"decision_id, so not separable by band), {rc.get('auto_skip_logged', 0)} skip-logged, "
+        f"{rc.get('auto_unlogged', 0)} with no skip row (dispatched-from-auto or silent inline)",
+        f"  - skip outcomes, drifted spellings folded into inline_other: "
+        f"{rc.get('skip_outcomes', {})}",
         "",
         "## GOAL 2 — Quality (user-correction rate)",
         "",

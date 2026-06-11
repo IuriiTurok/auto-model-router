@@ -211,6 +211,20 @@ audit_rows = [
         "group_id": "g1",
         "wall_ms": 3000,
     },
+    # skip rows: one canonical joining to the auto decision, one drifted
+    # spelling on the ask decision (must normalize, must NOT count as auto).
+    {
+        "ts": now_iso(),
+        "outcome": "continuity_inline",
+        "model": "haiku",
+        "decision_id": "r_a",
+    },
+    {
+        "ts": now_iso(),
+        "outcome": "inline_override",
+        "model": "opus",
+        "decision_id": "r_b",
+    },
 ]
 write_jsonl(ur.AUDIT_LOG, audit_rows)
 audit = ur.analyze_audit(days=7)
@@ -222,6 +236,21 @@ check("audit parallel batch detected", audit["parallel"]["batches"] >= 1)
 check(
     "audit wall saved = 1000 (sum 4000 - max 3000)",
     audit["parallel"]["wall_ms_saved"] == 1000,
+)
+
+# reconciliation: auto-band dispatch accounting + drifted-vocab normalization
+rec = audit["reconciliation"]
+check("recon auto_decisions = 1", rec["auto_decisions"] == 1)
+check("recon dispatched_total = 2", rec["dispatched_total"] == 2)
+check("recon auto_skip_logged = 1 (continuity joins r_a)", rec["auto_skip_logged"] == 1)
+check("recon auto_unlogged = 0", rec["auto_unlogged"] == 0)
+check(
+    "recon drifted spelling normalized to inline_other",
+    rec["skip_outcomes"].get("inline_other") == 1,
+)
+check(
+    "recon ask-band drifted skip not counted as auto",
+    rec["skip_outcomes"].get("continuity_inline") == 1 and rec["auto_skip_logged"] == 1,
 )
 
 
