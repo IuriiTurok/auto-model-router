@@ -14,9 +14,9 @@ your injected context. Honour it before doing any work.
 ```json
 {
   "band": "auto" | "ask" | "none",
-  "model": "haiku" | "sonnet" | "opus",
+  "model": "haiku" | "sonnet" | "opus" | "fable",
   "effort": "low" | "medium" | "high" | "xhigh",
-  "tier": "trivial" | "standard" | "complex" | "deep" | "override",
+  "tier": "trivial" | "standard" | "complex" | "deep" | "override" | "optout",
   "confidence": 0.0-1.0,
   "reason": "one-sentence justification",
   "source": "heuristic" | "haiku" | "default" | "override" | "project_config",
@@ -24,7 +24,8 @@ your injected context. Honour it before doing any work.
   "fanout": true | false,
   "fanout_hint": 3,
   "decision_id": "r_xxxxxxxxxx",
-  "thresholds": {"auto": 0.90, "ask": 0.60}
+  "thresholds": {"auto": 0.75, "ask": 0.60},
+  "continuity": true | false
 }
 ```
 
@@ -32,6 +33,12 @@ your injected context. Honour it before doing any work.
 **decomposable** prompt — multiple independent asks. Handle it with Branch E.
 `plan_mode` is **best-effort and usually `false`** — the hook can't see plan
 mode reliably. Trust your own context over this field (see Procedure).
+`tier == "optout"` means the user or project config has opted out of routing
+entirely for this prompt (`#noshift`, `#noroute`, or `"disabled": true`); treat
+it as `band == "none"` and proceed inline.
+`continuity: true` means the classifier detected that this prompt is a
+follow-up on an in-progress task — prefer staying inline rather than
+re-delegating to a worker.
 
 ## Procedure
 
@@ -188,9 +195,12 @@ Trust the user's intent above the classifier:
 
 - If the user explicitly said `do it yourself` / `don't delegate` /
   `stay on opus`, do that. The classifier is wrong in this case.
+  Force-routing via `#model=opus|sonnet|haiku|fable` in the prompt
+  is also honoured — the decision will have `band=auto, confidence=1.0`.
 - If the user already started a task on the current model and is
   iterating (5+ messages deep on the same task), don't re-delegate —
-  preserve session continuity.
+  preserve session continuity. If the decision carries a continuity
+  flag, prefer staying inline — the user is mid-iteration.
 - If the dispatched subagent fails or returns garbage, retry once
   inline at the current model and report the failure.
 
@@ -263,9 +273,10 @@ Each tier maps to a pre-registered subagent type:
 
 | Model  | subagent_type   | Use for                                                            |
 | ------ | --------------- | ------------------------------------------------------------------ |
-| haiku  | `router-haiku`  | Reads, lists, lookups, quick edits, classifications                |
-| sonnet | `router-sonnet` | Routine refactors, doc writing, spec edits, prototype iteration    |
-| opus   | `router-opus`   | Deep refactors, architecture, hard debugging, multi-file synthesis |
+| haiku  | `router-haiku`  | Reads, lists, lookups, quick edits, classifications                             |
+| sonnet | `router-sonnet` | Routine refactors, doc writing, spec edits, prototype iteration                 |
+| opus   | `router-opus`   | Deep refactors, architecture, hard debugging, multi-file synthesis              |
+| fable  | `router-fable`  | Frontier-stakes synthesis, irreversible high-blast-radius steps (manual/override-only) |
 
 The dispatched agent inherits the parent's working directory and
 project-level `CLAUDE.md` / `AGENTS.md` instructions.

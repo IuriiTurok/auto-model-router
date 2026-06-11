@@ -9,6 +9,7 @@ directionally sound. Always label downstream numbers as estimates.
 
 # USD per token (published per-MTok rate / 1_000_000).
 PRICES = {
+    "fable": {"in": 10.0 / 1e6, "out": 50.0 / 1e6},
     "opus": {"in": 5.0 / 1e6, "out": 25.0 / 1e6},
     "sonnet": {"in": 3.0 / 1e6, "out": 15.0 / 1e6},
     "haiku": {"in": 1.0 / 1e6, "out": 5.0 / 1e6},
@@ -26,6 +27,8 @@ def model_family(model_id: str | None) -> str | None:
     if not model_id:
         return None
     m = model_id.lower()
+    if "fable" in m:
+        return "fable"
     if "opus" in m:
         return "opus"
     if "sonnet" in m:
@@ -44,7 +47,8 @@ def cost(family: str, tokens_in: int, tokens_out: int) -> float:
 
 def counterfactual_saving(family: str, tokens_in: int, tokens_out: int) -> float:
     """$ saved by running these tokens on `family` instead of the baseline
-    (Opus). Zero for the baseline itself or unknown families.
+    (Opus). Zero for the baseline itself or unknown families. Note: Fable's
+    savings are legitimately negative (costs more than Opus), which is informative.
     """
     if family == BASELINE or family not in PRICES:
         return 0.0

@@ -3,6 +3,10 @@
 This plugin ships as a single-plugin marketplace. Two commands inside
 Claude Code and one optional shell command to wire up the CLI wrapper.
 
+v0.5 adds a fourth worker agent (`router-fable`, manual/override-only),
+an `optout` tier for clean opt-out signalling, and a `continuity` flag
+for mid-iteration prompts. The hook count and install steps are unchanged.
+
 ## 1 — Add the marketplace
 
 In any Claude Code session:
@@ -29,8 +33,9 @@ Confirm the install. Claude Code will:
   `hooks/auto-router.py` (no manual `settings.json` edit needed).
 - Make the skills `auto-model-routing` and `plan-with-models`
   discoverable.
-- Make the subagents `router-haiku`, `router-sonnet`, `router-opus`
-  available to the `Agent` tool.
+- Make the subagents `router-haiku`, `router-sonnet`, `router-opus`, and
+  `router-fable` available to the `Agent` tool. (`router-fable` is
+  manual/override-only — the classifier never auto-dispatches to it.)
 - Make the slash commands `/route` and `/route-status` available.
 
 ## 3 — (Optional but recommended) Install the cc-route CLI wrapper
@@ -111,7 +116,7 @@ If you wire the plugin by hand instead of via the marketplace (e.g. you
 cloned the repo straight into `~/.claude/plugins/auto-model-router/`), you
 must replicate everything the marketplace would auto-load. **`hooks/hooks.json`
 is the source of truth — mirror ALL of it, not just the first hook.** As of
-v0.3.0 that means **three** hooks:
+v0.3.0 that means **three** hooks (unchanged in v0.5.0):
 
 ```jsonc
 // ~/.claude/settings.json → "hooks"
@@ -141,7 +146,7 @@ Then symlink the skills, subagents, and **all** commands into `~/.claude/`:
 ```bash
 ln -sf ~/.claude/plugins/auto-model-router/skills/auto-model-routing ~/.claude/skills/auto-model-routing
 ln -sf ~/.claude/plugins/auto-model-router/skills/plan-with-models     ~/.claude/skills/plan-with-models
-for m in haiku sonnet opus; do
+for m in haiku sonnet opus fable; do
   ln -sf ~/.claude/plugins/auto-model-router/agents/router-$m.md ~/.claude/agents/router-$m.md
 done
 for c in route route-status router-report; do

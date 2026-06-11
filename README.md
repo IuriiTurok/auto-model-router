@@ -21,6 +21,13 @@ safe, writers run together only when their file sets are **disjoint**, and
 overlapping writers are serialized (or isolated in a git worktree). See
 [Plan-mode behaviour](#plan-mode-behaviour).
 
+**v0.5 additions:** a fourth worker agent `router-fable` (manual/override-only
+via `#model=fable` — never auto-dispatched) for frontier-stakes synthesis steps;
+an `optout` tier so `#noshift`/`#noroute`/disabled-project prompts emit a clean
+`tier=optout, band=none` signal instead of falling through silently; and a
+`continuity` flag in the decision block that tells the parent to prefer staying
+inline when the user is mid-iteration.
+
 ## Install
 
 See [INSTALL.md](INSTALL.md). TL;DR:
@@ -110,7 +117,8 @@ auto-model-router/
 ├── agents/
 │   ├── router-haiku.md      # worker subagent_type, model=haiku
 │   ├── router-sonnet.md     # worker subagent_type, model=sonnet
-│   └── router-opus.md       # worker subagent_type, model=opus
+│   ├── router-opus.md       # worker subagent_type, model=opus
+│   └── router-fable.md      # worker subagent_type, model=fable (manual/override-only)
 ├── commands/
 │   ├── route.md             # /route <prompt>  — force re-classify
 │   ├── route-status.md      # /route-status   — recent decisions + parallelism
@@ -137,9 +145,9 @@ No manual `settings.json` edit needed.
 
 ## Confidence bands
 
-- **`auto` (≥ 0.90)**: parent auto-dispatches via `Agent` and reports the
+- **`auto` (≥ 0.75)**: parent auto-dispatches via `Agent` and reports the
   worker's result. No interactive step.
-- **`ask` (0.60–0.90)**: parent calls `AskUserQuestion` with options
+- **`ask` (0.60–0.75)**: parent calls `AskUserQuestion` with options
   `[Use <model>] [Use Opus] [Stay on current]`. Honours your answer.
 - **`none` (< 0.60)**: silent. Hook emits an audit log entry but
   injects no context.
@@ -148,11 +156,11 @@ No manual `settings.json` edit needed.
 
 | Mechanism                          | Effect                                                                                                               |
 | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `#noshift` in the prompt           | Skip routing entirely for this prompt.                                                                               |
+| `#noshift` in the prompt           | Skip routing entirely for this prompt (opt-out, `tier=optout`).                                                      |
 | `#noroute` in the prompt           | Alias for `#noshift`.                                                                                                |
-| `#model=opus` (or sonnet/haiku)    | Force-route to that tier; confidence 1.0, band=auto.                                                                 |
+| `#model=opus` (or sonnet/haiku/fable) | Force-route to that tier; confidence 1.0, band=auto.                                                              |
 | Env `CC_ROUTER_DISABLE=1`          | Disable the hook globally for the shell.                                                                             |
-| Env `CC_ROUTER_AUTO_THRESHOLD=0.9` | Raise/lower the auto-delegate cutoff (default 0.90).                                                                 |
+| Env `CC_ROUTER_AUTO_THRESHOLD=0.9` | Raise/lower the auto-delegate cutoff (default 0.75).                                                                 |
 | Env `CC_ROUTER_ASK_THRESHOLD=0.6`  | Raise/lower the ask cutoff (default 0.60).                                                                           |
 | Env `ANTHROPIC_API_KEY`            | Enables the Haiku fallback classifier for ambiguous cases. Without it, low-confidence prompts default to Sonnet/ask. |
 | Project `.claude/router.json`      | Per-project overrides (see below). Found by walking up from `cwd`.                                                   |
@@ -313,7 +321,7 @@ marketplace), you can run it from a clone:
 git clone https://github.com/<owner>/auto-model-router ~/.claude/plugins/auto-model-router
 ln -sf ~/.claude/plugins/auto-model-router/skills/auto-model-routing ~/.claude/skills/auto-model-routing
 ln -sf ~/.claude/plugins/auto-model-router/skills/plan-with-models   ~/.claude/skills/plan-with-models
-for m in haiku sonnet opus; do
+for m in haiku sonnet opus fable; do
   ln -sf ~/.claude/plugins/auto-model-router/agents/router-$m.md ~/.claude/agents/router-$m.md
 done
 for c in route route-status router-report; do

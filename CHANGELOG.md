@@ -3,6 +3,40 @@
 All notable changes to auto-model-router. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is semver-ish.
 
+## [0.5.0] — 2026-06-11
+
+### Added
+
+- **Configurable `MODEL_TIERS` table** — routing parameters (speed/quality
+  profiles, pricing) now centralized and tunable per-deployment without code
+  changes. Reads from `.claude/router.json` or `~/.claude/router.json` (project
+  bias pattern).
+- **Fable tier manual-only mode** — `fable` tier restricted to explicit
+  overrides (e.g. `force_model: fable` in `.claude/router.json`). Rationale:
+  parent session already runs Fable; auto-routing to a child Fable subagent
+  doubles cost (~2x Opus pricing) with diminishing clarity gains. Audit rows
+  without fable selection skip this tier.
+- **Fable pricing row** — added to `hooks/pricing.py` for cost accounting when
+  fable is manually invoked.
+- **`router-fable` agent skill** — entry point for explicit fable-override
+  workflows (read-only task context, low-confidence prompts, detailed
+  inspection).
+- **Ultracode goal band=none opt-out** — `band: none` disables auto-routing for
+  a decision, treated as `ask`. Audit replay tooling skips `band: none` rows
+  (no counterfactual signal). Enables granular per-prompt tuning without bloating
+  the classifier.
+- **Session-continuity threshold bump** — `AUTO_THRESHOLD` incremented **0.75 →
+  0.85** after 5+ consecutive turns in the same session (learned from replay KPI:
+  high-confidence decisions cluster at turn 3+ as context stabilizes). Tracks
+  `turn_in_session` in audit.
+- **`CLASSIFIER_VERSION: 5`** — updated cache invalidation tag after model/rules
+  changes.
+
+### Changed
+
+- `plan-with-models` description trimmed (removed redundant "fan-out" mention —
+  routing now owns wavegen; plan owns DAG + outcome capture).
+
 ## [0.4.0] — 2026-06-01
 
 ### Added

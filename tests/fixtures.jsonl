@@ -24,3 +24,6 @@
 {"label":"no-fanout-atomic-q","prompt":"where is the config loaded?","expect":{"fanout":false}}
 {"label":"no-fanout-atomic-refactor","prompt":"refactor the rate limiter to use a token bucket","expect":{"fanout":false}}
 {"label":"no-fanout-single-and","prompt":"read the file and tell me what it does","expect":{"fanout":false}}
+{"label":"override-fable","prompt":"#model=fable redesign the persona isolation boundary","expect":{"tier":"override","model":"fable","effort":"xhigh","band":"auto"}}
+{"label":"deep-no-fable-auto","prompt":"redesign the whole ingestion architecture for multi-tenant isolation","expect":{"model":"opus"}}
+{"label":"ultracode-silent","prompt":"ultracode audit the entire codebase","expect":{"silent":true}}

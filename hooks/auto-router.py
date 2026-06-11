@@ -50,7 +50,38 @@ PROJECT_CONFIG_FILENAME = ".claude/router.json"
 
 # Bumped whenever classifier output or thresholds change; cache_get treats
 # entries with a different version as a miss so old entries naturally expire.
-CLASSIFIER_VERSION = 4
+CLASSIFIER_VERSION = 5
+
+# Canonical model tier table. effort is the tier's default effort; agent is the
+# router-<model> subagent; auto_routable is False for tiers the classifier may
+# never auto-pick (manual dispatch only); auto_floor overrides AUTO_THRESHOLD
+# for that model in band_for() (None = use AUTO_THRESHOLD).
+MODEL_TIERS = {
+    "haiku": {
+        "effort": "low",
+        "agent": "router-haiku",
+        "auto_routable": True,
+        "auto_floor": None,
+    },
+    "sonnet": {
+        "effort": "medium",
+        "agent": "router-sonnet",
+        "auto_routable": True,
+        "auto_floor": None,
+    },
+    "opus": {
+        "effort": "high",
+        "agent": "router-opus",
+        "auto_routable": True,
+        "auto_floor": 0.90,
+    },
+    "fable": {
+        "effort": "xhigh",
+        "agent": "router-fable",
+        "auto_routable": False,
+        "auto_floor": None,
+    },
+}
 
 # Audit log rotation
 AUDIT_ROTATE_BYTES = int(
@@ -130,11 +161,11 @@ def apply_project_rules(prompt: str, cfg: dict) -> dict | None:
             matched = pattern.lower() in lower
         if matched:
             model = rule.get("model", "sonnet")
-            effort_map = {"haiku": "low", "sonnet": "medium", "opus": "high"}
+            default_effort = MODEL_TIERS.get(model, {}).get("effort", "medium")
             return {
                 "tier": "project_rule",
                 "model": model,
-                "effort": rule.get("effort", effort_map.get(model, "medium")),
+                "effort": rule.get("effort", default_effort),
                 "confidence": float(rule.get("confidence", 0.95)),
                 "source": "project_config",
                 "reasoning": rule.get("reason", f"project rule matched: {pattern}"),
@@ -157,7 +188,7 @@ DEEP_VERBS = re.compile(
     r"diagnose|root[- ]cause)\b",
     re.I,
 )
-OVERRIDE_PATTERN = re.compile(r"#model=(haiku|sonnet|opus)\b", re.I)
+OVERRIDE_PATTERN = re.compile(r"#model=(" + "|".join(MODEL_TIERS) + r")\b", re.I)
 FILE_PATH = re.compile(
     r"(?<![:\w])(?:~|\.{0,2}/)[\w./~-]+|\b[\w-]+\.(?:py|ts|tsx|js|jsx|md|json|yaml|yml|sh|rs|go|java|cpp|c|h)\b"
 )
@@ -320,11 +351,10 @@ def score_effort(prompt: str) -> tuple[str, float, str]:
 
 def _project_default_result(project_cfg: dict, why: str) -> dict:
     pinned = project_cfg["default_model"]
-    effort_map = {"haiku": "low", "sonnet": "medium", "opus": "high"}
     return {
         "tier": "project_default",
         "model": pinned,
-        "effort": effort_map.get(pinned, "medium"),
+        "effort": MODEL_TIERS.get(pinned, {}).get("effort", "medium"),
         "confidence": 0.85,
         "source": "project_config",
         "reasoning": f"project default {pinned} ({why})",
@@ -397,13 +427,47 @@ def cache_put(prompt: str, result: dict) -> None:
         pass
 
 
+def session_bump(session_id: str) -> int:
+    """Maintain CACHE_DIR/sessions/<session_id>.json {"turns": N, "ts": epoch}.
+
+    Read, increment, and write the per-session turn counter on each invocation,
+    opportunistically pruning session files older than 24h. All I/O is wrapped
+    in try/except OSError and silent, mirroring cache_put. Returns the new turn
+    count (0 on any I/O failure, so the caller treats it as no bump)."""
+    sessions_dir = os.path.join(CACHE_DIR, "sessions")
+    path = os.path.join(sessions_dir, f"{session_id}.json")
+    try:
+        os.makedirs(sessions_dir, exist_ok=True)
+        cutoff = time.time() - 24 * 3600
+        for old in glob.glob(os.path.join(sessions_dir, "*.json")):
+            try:
+                if os.path.getmtime(old) < cutoff:
+                    os.remove(old)
+            except OSError:
+                pass
+        turns = 0
+        try:
+            with open(path) as f:
+                turns = int(json.load(f).get("turns", 0))
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+            turns = 0
+        turns += 1
+        with open(path, "w") as f:
+            json.dump({"turns": turns, "ts": int(time.time())}, f)
+        return turns
+    except OSError:
+        return 0
+
+
 def band_for(
     confidence: float, auto_threshold: float, ask_threshold: float, model: str = ""
 ) -> str:
     # Asymmetric risk: misrouting to opus is the expensive failure mode, so
-    # opus picks need a higher confidence floor than cheaper models. The
-    # opus floor stays at the legacy 0.90; cheaper picks use auto_threshold.
-    effective_auto = max(auto_threshold, 0.90) if model == "opus" else auto_threshold
+    # opus picks need a higher confidence floor than cheaper models. The floor
+    # comes from MODEL_TIERS[model]["auto_floor"] (opus pins the legacy 0.90);
+    # models with no floor use auto_threshold.
+    floor = MODEL_TIERS.get(model, {}).get("auto_floor")
+    effective_auto = max(auto_threshold, floor) if floor is not None else auto_threshold
     if confidence >= effective_auto:
         return "auto"
     if confidence >= ask_threshold:
@@ -469,6 +533,26 @@ def main() -> int:
     lower = prompt.lower()
     if "#noshift" in lower or "#noroute" in lower:
         return 0
+    if (
+        re.search(r"\bultracode\b", lower)
+        or lower.startswith("/goal")
+        or "/goal-driven" in lower
+    ):
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        audit_append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
+                "decision": {
+                    "band": "none",
+                    "tier": "optout",
+                    "model": None,
+                    "reason": "ultracode/goal-driven turn — must stay on parent",
+                },
+                "outcome": "silent",
+            }
+        )
+        return 0
     if len(prompt.split()) < 3 and not prompt.endswith("?"):
         return 0
 
@@ -492,11 +576,10 @@ def main() -> int:
     override = OVERRIDE_PATTERN.search(prompt)
     if override:
         forced = override.group(1).lower()
-        effort_map = {"haiku": "low", "sonnet": "medium", "opus": "high"}
         result = {
             "tier": "override",
             "model": forced,
-            "effort": effort_map[forced],
+            "effort": MODEL_TIERS[forced]["effort"],
             "confidence": 1.0,
             "source": "override",
             "reasoning": f"user override #model={forced}",
@@ -567,11 +650,33 @@ def main() -> int:
                 f"{tier_effort}->{scored_effort}: {effort_reason}"
             )
 
+    # Parent session already runs Fable 5; fable is 2x opus price — manual
+    # dispatch only. Clamp a classifier-picked fable down to opus unless the
+    # user explicitly asked for it (#model=fable) or a project rule pinned it.
+    if result.get("model") == "fable" and result.get("source") not in (
+        "override",
+        "project_config",
+    ):
+        result["model"] = "opus"
+
+    # Session continuity: deeper into a session, nudge the auto threshold up so
+    # the router is a touch more conservative about auto-dispatching. Only when
+    # the payload carries a session_id — otherwise complete no-op (no sessions/
+    # dir is created).
+    continuity = None
+    effective_auto_threshold = auto_threshold
+    session_id = payload.get("session_id")
+    if session_id:
+        turns = session_bump(str(session_id))
+        if turns >= int(os.environ.get("CC_ROUTER_CONTINUITY_TURNS", "5")):
+            effective_auto_threshold = auto_threshold + 0.1
+            continuity = {"turns": turns, "bump": 0.1}
+
     plan_mode = detect_plan_mode(payload)
     fanout, fanout_hint = detect_fanout(prompt)
     band = band_for(
         float(result.get("confidence", 0)),
-        auto_threshold,
+        effective_auto_threshold,
         ask_threshold,
         result.get("model", ""),
     )
@@ -588,9 +693,11 @@ def main() -> int:
         "plan_mode": plan_mode,
         "fanout": fanout,
         "decision_id": decision_id,
-        "thresholds": {"auto": auto_threshold, "ask": ask_threshold},
+        "thresholds": {"auto": effective_auto_threshold, "ask": ask_threshold},
         "project_config": project_cfg.get("_source"),
     }
+    if continuity is not None:
+        decision["continuity"] = continuity
     if fanout:
         decision["fanout_hint"] = fanout_hint
 

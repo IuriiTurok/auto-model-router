@@ -38,12 +38,29 @@ while IFS= read -r fixture; do
   case "$fixture" in '#'*) continue ;; esac
 
   label=$(printf '%s' "$fixture" | jq -r '.label // ""')
+  expect_silent=$(printf '%s' "$fixture" | jq -r '.expect.silent // false')
   expect_tier=$(printf '%s' "$fixture" | jq -r '.expect.tier // ""')
   expect_model=$(printf '%s' "$fixture" | jq -r '.expect.model // ""')
   expect_effort=$(printf '%s' "$fixture" | jq -r '.expect.effort // ""')
   expect_band=$(printf '%s' "$fixture" | jq -r '.expect.band // ""')
   expect_conf_min=$(printf '%s' "$fixture" | jq -r '.expect.conf_min // 0')
   expect_fanout=$(printf '%s' "$fixture" | jq -r 'if .expect|has("fanout") then (.expect.fanout|tostring) else "" end')
+
+  # expect.silent: assert hook produces empty stdout and exits 0
+  if [ "$expect_silent" = "true" ]; then
+    hook_output=$(printf '%s' "$fixture" \
+      | jq -c '{prompt: .prompt, cwd: "/tmp"}' \
+      | python3 "$HOOK")
+    hook_rc=$?
+    if [ $hook_rc -eq 0 ] && [ -z "$hook_output" ]; then
+      PASS=$((PASS + 1))
+      printf 'PASS L%02d [%-26s] silent=true exit=0\n' "$LINE" "$label"
+    else
+      FAIL=$((FAIL + 1))
+      printf 'FAIL L%02d [%-26s] silent: exit=%d output=%s\n' "$LINE" "$label" "$hook_rc" "$hook_output"
+    fi
+    continue
+  fi
 
   decision=$(printf '%s' "$fixture" \
     | jq -c '{prompt: .prompt, cwd: "/tmp"}' \
@@ -96,6 +113,8 @@ echo "=== tests/test_replay_kpi.py ==="
 python3 "$DIR/test_replay_kpi.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
 echo "=== tests/test_router_loop.py ==="
 python3 "$DIR/test_router_loop.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
+echo "=== tests/test_continuity.py ==="
+python3 "$DIR/test_continuity.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
 
 echo "==="
 [ "$SUITE_FAIL" -eq 0 ] && echo "ALL SUITES PASS" || echo "SUITE FAILURES: $SUITE_FAIL"

@@ -1,6 +1,6 @@
 ---
 name: plan-with-models
-description: Use whenever writing an implementation plan in plan mode (or any time the user asks for a step-by-step plan). Requires every step to carry `Model:`, `Effort:`, and `Files:` tags so the executor can dispatch each step to the right model via Agent(subagent_type="router-<model>") AND run independent steps in parallel waves without file conflicts. Heterogeneous plans (cheap steps on Haiku/Sonnet, deep steps on Opus) drop quota burn ~30%; parallel waves cut wall-clock on top.
+description: Use whenever writing an implementation plan in plan mode (or any time the user asks for a step-by-step plan). Requires every step to carry `Model:`, `Effort:`, and `Files:` tags so the executor can dispatch each step to the right model via Agent(subagent_type="router-<model>") AND run independent steps in parallel waves without file conflicts.
 ---
 
 # plan-with-models
@@ -15,7 +15,7 @@ model and you lose the savings.
 ```markdown
 ### Step N — <Imperative action phrase>
 
-Model: haiku | sonnet | opus
+Model: haiku | sonnet | opus | fable
 Effort: low | medium | high | xhigh
 Files: <comma-separated paths or "none">
 Action: <what to do — 1-3 sentences>
@@ -40,6 +40,7 @@ Optional fields when relevant:
 | Multi-file refactor (4+ files). Architectural decision. Hard debugging. New module design. CAD/firmware geometry. Cross-cutting performance work. | **opus**                                                      |
 | Verification (run tests, lint, type-check, smoke-test UI).                                                                                        | **haiku** if mechanical; **sonnet** if interpretation needed. |
 | Final review / sanity check of the whole change.                                                                                                  | **sonnet** or **opus** depending on stakes.                   |
+| Frontier-stakes synthesis / irreversible high-blast-radius steps.                                                                                 | **fable** — 2x opus price; use sparingly. Parent usually IS Fable 5. |
 
 ## Effort tiers
 
@@ -141,7 +142,9 @@ Agent(subagent_type=f"router-{step['model']}", description=f"[grp:{batch_id}] {s
 ```
 
 - Pass the step's model as `router-<model>` (cheapest sufficient model — the
-  table above).
+  table above). Valid values: `router-haiku`, `router-sonnet`, `router-opus`,
+  `router-fable` (fable is manual/override-only — only use when the step
+  explicitly declares `Model: fable`).
 - Prefix `description` with `[grp:<batch_id>]` (any short id) so the
   outcome-capture hook can correlate the batch — this powers the
   "wall-clock saved" metric in `/route-status`.
