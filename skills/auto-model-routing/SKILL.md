@@ -38,7 +38,7 @@ entirely for this prompt (`#noshift`, `#noroute`, or `"disabled": true`); treat
 it as `band == "none"` and proceed inline.
 `continuity: true` means the classifier detected that this prompt is a
 follow-up on an in-progress task — prefer staying inline rather than
-re-delegating to a worker.
+re-delegating to a worker (log outcome `continuity_inline`).
 
 ## Procedure
 
@@ -173,7 +173,8 @@ Every `auto`-band decision must end as exactly ONE of:
 - a real `router-*` dispatch — the PostToolUse hook logs `delegated`
   automatically; write nothing yourself — or
 - a skip row you append, using ONLY this vocabulary:
-  `skipped_trivial` | `same_model_inline` | `worker_failed`.
+  `skipped_trivial` | `same_model_inline` | `continuity_inline` |
+  `worker_failed`.
 
 ```bash
 echo "$(jq -nc --arg id "<decision_id>" --arg outcome "<OUTCOME>" --arg model "<model>" '{ts: (now|todate), decision_id: $id, outcome: $outcome, model: $model}')" >> ~/.claude/cache/router/audit.jsonl
@@ -186,6 +187,9 @@ echo "$(jq -nc --arg id "<decision_id>" --arg outcome "<OUTCOME>" --arg model "<
 - `skipped_trivial` is narrow: ONE read-only tool call answers the user
   with no synthesis (a single Read of a known path, one `git status`).
   Needs a second tool call or reasoning over the output? Dispatch.
+- `continuity_inline` covers both the decision block's `continuity: true`
+  flag and the "user is mid-iteration on this task" override — staying
+  inline to preserve session context.
 - If `jq` is missing, write the line with python; if the write fails,
   proceed with the work anyway.
 
