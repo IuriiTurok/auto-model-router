@@ -24,7 +24,10 @@ def main() -> int:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         return 0
-    if (payload.get("toolName") or payload.get("tool") or "") != "Agent":
+    tool = (
+        payload.get("tool_name") or payload.get("toolName") or payload.get("tool") or ""
+    )
+    if tool != "Agent":
         return 0
     tool_input = payload.get("toolInput") or payload.get("tool_input") or {}
     if not (tool_input.get("subagent_type") or "").startswith("router-"):

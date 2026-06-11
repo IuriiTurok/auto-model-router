@@ -37,6 +37,7 @@ mode reliably. Trust your own context over this field (see Procedure).
 
 ```
 IN PLAN MODE?  → don't delegate; use `plan-with-models` (see below) — FIRST CHECK
+SAME MODEL?    → suggested model == your session model → stay inline — SECOND CHECK
 band == "auto" + fanout → Branch E: decompose + parallel dispatch
 band == "auto" → Branch A: DELEGATE to one worker
 band == "ask"  → Branch B: CONFIRM, then delegate (or fan out)
@@ -49,6 +50,15 @@ band. If a system reminder in your context says plan mode is active, route to
 that field is best-effort and is almost always `false` even when you ARE in
 plan mode (the hook can't see plan state). Do not trust it; trust your own
 context.
+
+**Same-model short-circuit (second check).** If the suggested model is the
+model this session is already running on (an `opus` suggestion while you run
+Opus or another opus-class model counts), dispatching saves nothing and adds
+latency — stay inline. On `auto` band, log outcome `same_model_inline` (see
+Outcome logging). On `ask` band, skip the question and log
+`user_choice: "auto_inline_same_model"` to overrides.jsonl (Branch B step 3
+format). Every recorded ask-band override to date picked Stay-on-current in
+exactly this situation.
 
 ### Branch A — `band == "auto"`
 
@@ -64,14 +74,11 @@ context.
    violation of this rule.)
 3. When it returns, relay its result to the user in **1–2 sentences**
    (plus any direct artifact URLs). Do not paraphrase its entire output.
-4. Append an outcome line to the audit log:
-
-   ```bash
-   echo "$(jq -nc --arg id "<decision_id>" --arg outcome "delegated" --arg model "<model>" '{ts: now, decision_id: $id, outcome: $outcome, model: $model}')" >> ~/.claude/cache/router/audit.jsonl
-   ```
-
-   (Use the `decision_id` from the `<router-decision>` block. If `jq`
-   isn't available, write a one-line JSON with python or skip silently.)
+4. Do NOT hand-log the dispatch — the PostToolUse hook
+   (`post-agent-audit.py`) records every `router-*` Agent call
+   automatically (outcome `delegated`, plus tokens, wall time, and
+   `group_id`). You write a row yourself only when you DON'T dispatch —
+   see Outcome logging below.
 
 ### Branch B — `band == "ask"`
 
@@ -100,8 +107,10 @@ context.
 
    Substitute the `decision_id` from the `<router-decision>` block, the
    suggested model the router proposed, and one of `use_suggested`,
-   `use_opus`, or `stay_inline` for the user's pick. Never block on
-   this — if the write fails, proceed with the work anyway.
+   `use_opus`, or `stay_inline` for the user's pick (or
+   `auto_inline_same_model` when the same-model short-circuit skipped
+   the question). Never block on this — if the write fails, proceed
+   with the work anyway.
 
 ### Branch C — `band == "none"` or no decision block
 
@@ -150,6 +159,29 @@ sequentially; or there's really just one task dressed up with conjunctions
 ("read the file **and** tell me what it does" is one task). When in doubt
 on a borderline case, prefer a single dispatch.
 
+## Outcome logging (mandatory)
+
+Every `auto`-band decision must end as exactly ONE of:
+
+- a real `router-*` dispatch — the PostToolUse hook logs `delegated`
+  automatically; write nothing yourself — or
+- a skip row you append, using ONLY this vocabulary:
+  `skipped_trivial` | `same_model_inline` | `worker_failed`.
+
+```bash
+echo "$(jq -nc --arg id "<decision_id>" --arg outcome "<OUTCOME>" --arg model "<model>" '{ts: (now|todate), decision_id: $id, outcome: $outcome, model: $model}')" >> ~/.claude/cache/router/audit.jsonl
+```
+
+- `ts` must be ISO-8601: `now|todate`, never bare `now` — an epoch float
+  is invisible to the analyzers.
+- Do not invent other outcome spellings (`inline`, `stayed_inline`,
+  `inline_override`, …) — they pollute the stats.
+- `skipped_trivial` is narrow: ONE read-only tool call answers the user
+  with no synthesis (a single Read of a known path, one `git status`).
+  Needs a second tool call or reasoning over the output? Dispatch.
+- If `jq` is missing, write the line with python; if the write fails,
+  proceed with the work anyway.
+
 ## When to override the router
 
 Trust the user's intent above the classifier:
@@ -171,7 +203,7 @@ Trust the user's intent above the classifier:
   correct.
 - **Don't delegate trivial single-tool calls** (one `Read` of a known
   path, one `git status`). The dispatch overhead exceeds the savings.
-  Treat as `band == "none"`.
+  Treat as `band == "none"` and log `skipped_trivial`.
 - **Don't delegate when the user is mid-iteration on the parent.** The
   delegated agent lacks the conversation context.
 

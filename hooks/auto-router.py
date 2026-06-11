@@ -478,10 +478,14 @@ def main() -> int:
 
     loop_cfg = load_loop_config()
     auto_threshold = float(
-        project_cfg.get("auto_threshold", loop_cfg.get("auto_threshold", DEFAULT_AUTO_THRESHOLD))
+        project_cfg.get(
+            "auto_threshold", loop_cfg.get("auto_threshold", DEFAULT_AUTO_THRESHOLD)
+        )
     )
     ask_threshold = float(
-        project_cfg.get("ask_threshold", loop_cfg.get("ask_threshold", DEFAULT_ASK_THRESHOLD))
+        project_cfg.get(
+            "ask_threshold", loop_cfg.get("ask_threshold", DEFAULT_ASK_THRESHOLD)
+        )
     )
 
     # Explicit override -> emit a high-confidence auto decision and skip classification
@@ -625,10 +629,12 @@ def main() -> int:
         instruction = (
             f"AUTO-ROUTE: dispatch this prompt to a `router-{result['model']}` "
             "subagent via the Agent tool instead of executing it inline. After "
-            "the agent returns, summarise its result in 1-2 sentences. Skip "
-            "delegation only if the task is genuinely trivial (single Read/Bash "
-            "that takes <5 s). Use the `auto-model-routing` skill for the full "
-            "procedure."
+            "the agent returns, summarise its result in 1-2 sentences. Only two "
+            "skips are legal, and BOTH must be logged per the skill's Outcome "
+            "logging section: genuinely trivial (ONE read-only tool call, no "
+            f"synthesis) -> `skipped_trivial`; or `{result['model']}` is the "
+            "model you are already running on -> `same_model_inline`. Use the "
+            "`auto-model-routing` skill for the full procedure."
         )
     else:  # band == "ask"
         fan_note = (
@@ -639,7 +645,10 @@ def main() -> int:
         )
         instruction = (
             f"AMBIGUOUS classification ({band}, confidence={decision['confidence']}). "
-            f"Before doing the work, call AskUserQuestion with options "
+            f"If `{result['model']}` is the model you are already running on, "
+            "skip the question, stay inline, and log "
+            "`user_choice: auto_inline_same_model` to overrides.jsonl (see the "
+            "skill). Otherwise call AskUserQuestion with options "
             f"[Use {result['model']} (Recommended)] [Use Opus] [Stay on current]. "
             f"Honour the answer. Use the `auto-model-routing` skill for the procedure.{fan_note}"
         )

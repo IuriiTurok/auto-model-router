@@ -130,7 +130,9 @@ def main() -> int:
     except (json.JSONDecodeError, ValueError):
         return 0
 
-    tool = payload.get("toolName") or payload.get("tool") or ""
+    tool = (
+        payload.get("tool_name") or payload.get("toolName") or payload.get("tool") or ""
+    )
     if tool != "Agent":
         return 0
 
