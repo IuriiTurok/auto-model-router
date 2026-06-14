@@ -9,6 +9,63 @@ You are running as a **router parent**. The auto-model-router hook has
 classified the user's prompt and emitted a `<router-decision>` block in
 your injected context. Honour it before doing any work.
 
+## Contents
+
+1. [Inputs / Outputs / Dependencies](#inputs--outputs--dependencies)
+2. [Decision schema](#decision-schema)
+3. [Procedure](#procedure) — the dispatcher; read this first
+4. [Branch A — `band == "auto"`](#branch-a--band--auto)
+5. [Branch B — `band == "ask"`](#branch-b--band--ask)
+6. [Branch C — `band == "none"` or no decision block](#branch-c--band--none-or-no-decision-block)
+7. [Branch D — plan mode (parent-authoritative)](#branch-d--plan-mode-parent-authoritative)
+8. [Branch E — fanout](#branch-e--band--auto-or-ask-and-fanout--true)
+9. [Outcome logging (mandatory)](#outcome-logging-mandatory)
+10. [When to override the router](#when-to-override-the-router)
+11. [Failure modes to avoid](#failure-modes-to-avoid)
+12. [Retry / escalation policy](#retry--escalation-policy)
+13. [Self-learning](#self-learning)
+14. [Tooling & evals](#tooling--evals)
+15. [How to invoke the worker](#how-to-invoke-the-worker)
+
+## Workflow
+
+Upstream: `auto-router.py` UserPromptSubmit hook (emits the decision block);
+nightly Phase 5 (Bridge B) appends advisory model-outcome rows to
+`signal.jsonl`. Downstream: `router-haiku`/`router-sonnet`/`router-opus`/
+`router-fable` workers; `router_loop.py` / `usage-report.py` consume the audit
+log. Sibling: `plan-with-models` (Branch D).
+
+## Inputs / Outputs / Dependencies
+
+**Inputs**
+- A `<router-decision>` JSON block injected by the `UserPromptSubmit` hook
+  (`hooks/auto-router.py`) — fields enumerated under [Decision schema](#decision-schema).
+- The parent's own context — **authoritative** for plan-mode state (the
+  `plan_mode` field is best-effort and almost always `false`; see Procedure).
+- **Advisory, read-only, optional:** `~/.claude/cache/router/signal.jsonl`
+  (nightly Phase-5 realized-quality rows, Bridge B). Fail-open — see the
+  advisory-signal note under [Decision schema](#decision-schema). Absent or
+  stale ⇒ behave exactly as today.
+
+**Outputs**
+- One of: (a) an `Agent` dispatch to a `router-<model>` subagent (Branch A/E);
+  (b) `AskUserQuestion` + the chosen branch (Branch B); (c) inline execution
+  (Branch C/D).
+- Plus an appended JSON row in `~/.claude/cache/router/audit.jsonl`
+  (skip/failure outcomes) or `overrides.jsonl` (ask-band user choice).
+  Branch-A/E dispatches are auto-logged `delegated` by the
+  `post-agent-audit.py` PostToolUse hook — the parent writes nothing for those.
+
+**Dependencies**
+- Upstream: `auto-router.py` (UserPromptSubmit hook) · project `.claude/router.json`
+  and `~/.claude/router.json` (project bias / opt-out) · nightly Phase 5 (Bridge B
+  `signal.jsonl`, advisory).
+- Downstream: `router-haiku` · `router-sonnet` · `router-opus` · `router-fable`
+  workers · `router_loop.py` / sil kernel (`/router-loop`) · `tools/usage-report.py`
+  (`/router-report`) · `plan-with-models` (Branch D).
+- Deterministic tooling and evals are documented in
+  [`references/tooling.md`](references/tooling.md).
+
 ## Decision schema
 
 ```json
@@ -39,6 +96,27 @@ it as `band == "none"` and proceed inline.
 `continuity: true` means the classifier detected that this prompt is a
 follow-up on an in-progress task — prefer staying inline rather than
 re-delegating to a worker (log outcome `continuity_inline`).
+
+### Advisory signal (Bridge B — fail-open, subordinate)
+
+`~/.claude/cache/router/signal.jsonl` is an **optional, read-only, advisory**
+input the nightly Phase-5 step appends to (realized model-outcome rows —
+`{model, task_class, verdict ∈ ok|partial|failed}`). It is a *nudge on
+classification confidence only*, never an authority:
+
+- It **never** overrides the band decision tree, the same-model
+  short-circuit, plan-mode parent-authority, or an explicit user override.
+- **Fail-open:** if the file is absent, empty, or stale (most recent `ts`
+  older than ~14 days), ignore it entirely and behave exactly as today on
+  the decision block's own `band` / `confidence`. Never block on a read.
+- When present and fresh, treat a recent run of `failed` verdicts for the
+  suggested `model` at this task class as a weak reason to lean toward the
+  next tier up on a *borderline* `auto`/`ask` confidence — but only within
+  the band the decision tree already chose. Do not flip `none`→`auto`, do
+  not skip an `ask` confirmation, and do not change which branch runs.
+- The authoritative consumer is `router_loop.py` (it folds `signal.jsonl`
+  into the rung-2 refit per the frozen sil contract). The parent reads it
+  only as this soft tie-breaker; when in doubt, follow the decision block.
 
 ## Procedure
 
@@ -134,6 +212,9 @@ procedure). This is where the user's "create the respective agents for
 specific tasks" happens: each plan step becomes a `router-<model>` agent,
 and disjoint-file steps in the same wave fire together.
 
+**Recommended next step (plan mode):** hand the plan to `plan-with-models`
+and let it own wave execution.
+
 ### Branch E — `band == "auto"` (or "ask") **and** `fanout == true`
 
 The prompt decomposes into independent subtasks (numbered list, "X and Y
@@ -220,6 +301,12 @@ Trust the user's intent above the classifier:
   Treat as `band == "none"` and log `skipped_trivial`.
 - **Don't delegate when the user is mid-iteration on the parent.** The
   delegated agent lacks the conversation context.
+- **Silent-inline drift.** If you decide to stay inline on an `auto` band
+  for any reason not covered by the controlled vocabulary, you MUST still
+  write a skip row (mapping the reason onto the nearest allowed outcome).
+  An unlogged inline turn is the #1 source of the dispatch-attribution gap —
+  it makes follow-through look far lower than it is and starves the data
+  `router_loop.py` learns from.
 
 ## Retry / escalation policy
 
@@ -270,6 +357,47 @@ note in the audit log whether the result quality matched the elapsed
 time. Patterns of slow-and-mediocre at a low tier are a sign to bump
 the project's `default_model` or add a `rules:` entry in
 `.claude/router.json`.
+
+## Self-learning
+
+This skill's **routing** loop is already self-improving via `router_loop.py`
+(the sil rung-2 config loop) reading `audit.jsonl` / `overrides.jsonl` /
+`signal.jsonl`, closed by `/router-report` and `/router-loop`. Do **not**
+duplicate or hand-tune that here — it owns thresholds, project bias, and the
+KEEP/REVERT decisions.
+
+The lightweight block below is **only** for *non-routing* gotchas — operational
+or usage snags this skill hits that the KPI loop can't see (a wrong path, a
+`jq`/`python` fallback quirk, an `AskUserQuestion`/dispatch interaction, etc.).
+Resolve the lessons file once, first hit wins:
+1. `<project>/.claude/lessons/auto-model-routing.md`  (preferred when inside a project)
+2. `<this-skill-dir>/LESSONS.md`           (fallback when there is no project context)
+
+**At run START (read-only, fail-open):**
+- Read the lessons file(s) that exist (load both if both do). If none exist, continue silently.
+- Read only the last ~20 lines; treat each `- YYYY-MM-DD …` line as a standing constraint for this run.
+- Never block on a missing file; absence just means "no lessons yet".
+
+**At run END (append, only when warranted):**
+- Append a lesson **only if** this run produced a *correction* (the user fixed/redirected your output),
+  a *gotcha* (a non-obvious failure you had to work around), or a *durable insight* worth reusing.
+  Routine successful runs append nothing — keep the file high-signal. Routing-quality
+  signals belong in `audit.jsonl`, not here.
+- One physical line, exact format:
+  `- YYYY-MM-DD <imperative fix or invariant> [ctx: auto-model-routing/<project-or-->]`
+- Create the file (and parent dir) on first append; otherwise append. Never rewrite existing lines.
+- De-dupe: if an equivalent rule already exists in the last ~20 lines, skip the append.
+
+Optional deterministic append (when a shell is available), instead of hand-writing the line:
+`python3 ~/.claude/lib/self-improving-loop/sil/cli.py lessons-append \
+  --file "<resolved-path>" --date "YYYY-MM-DD" --window "run" --note "<imperative rule>" --tweak "auto-model-routing/<project>"`
+
+## Tooling & evals
+
+Offline eval and the improve-loop are documented in
+[`references/tooling.md`](references/tooling.md): `router_loop.py` (sil rung-2,
+`/router-loop`), `usage-report.py` (KPIs, `/router-report`), `analyze-audit.py`,
+and `replay_kpi.py` (offline counterfactual re-banding).
 
 ## How to invoke the worker
 
