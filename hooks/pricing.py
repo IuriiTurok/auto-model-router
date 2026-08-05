@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Per-MTok price table + cost helpers, shared by the usage report.
 
-Rates are approximate (per the Anthropic models/pricing docs, 4.x era) and
+Rates are approximate (per the Anthropic models/pricing docs, 5.x era —
+Fable 5 / Opus 5 / Sonnet 5 / Haiku 4.5) and
 exclude cache-token pricing — cache is a second-order correction and is
 ignored equally on both sides of the savings delta, so the estimate stays
 directionally sound. Always label downstream numbers as estimates.

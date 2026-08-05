@@ -50,7 +50,7 @@ PROJECT_CONFIG_FILENAME = ".claude/router.json"
 
 # Bumped whenever classifier output or thresholds change; cache_get treats
 # entries with a different version as a miss so old entries naturally expire.
-CLASSIFIER_VERSION = 5
+CLASSIFIER_VERSION = 6
 
 # Canonical model tier table. effort is the tier's default effort; agent is the
 # router-<model> subagent; auto_routable is False for tiers the classifier may
@@ -58,7 +58,7 @@ CLASSIFIER_VERSION = 5
 # for that model in band_for() (None = use AUTO_THRESHOLD).
 MODEL_TIERS = {
     "haiku": {
-        "effort": "low",
+        "effort": "low",  # cosmetic: Haiku 4.5 does not support the effort param
         "agent": "router-haiku",
         "auto_routable": True,
         "auto_floor": None,
@@ -183,6 +183,14 @@ COMPLEX_VERBS = re.compile(
     r"restructure|port|extract|consolidate)\b",
     re.I,
 )
+# Breadth signals that keep a short "complex" verb on Opus rather than
+# downshifting to Sonnet — e.g. "redesign the whole architecture" is not a
+# light single-surface task even though it is short.
+BREADTH_SIGNAL = re.compile(
+    r"\b(architect\w*|whole|entire|subsystem|infrastructure|platform|"
+    r"multi[- ]?tenant|end[- ]to[- ]end|system[- ]wide|codebase)\b",
+    re.I,
+)
 DEEP_VERBS = re.compile(
     r"\b(plan|architect|design|investigate|brainstorm|analy[sz]e|audit|profile|"
     r"diagnose|root[- ]cause)\b",
@@ -248,28 +256,40 @@ def classify_heuristic(prompt: str) -> dict | None:
     if DEEP_VERBS.search(lower):
         # Long, file-anchored design/audit requests are highest-signal opus work.
         conf = 0.95 if words > 25 and has_path else 0.85
+        # Opus 5: start at `high`, not `xhigh`. `score_effort` still promotes
+        # genuinely heavy work to xhigh; keeping the tier baseline at high
+        # avoids the effort/tier gap that needlessly caps deep picks into `ask`.
         return {
             "tier": "deep",
             "model": "opus",
-            "effort": "xhigh",
+            "effort": "high",
             "confidence": conf,
             "source": "heuristic",
             "reasoning": "explicit design/plan/investigate intent",
         }
     if COMPLEX_VERBS.search(lower):
-        if has_code:
-            conf = 0.92
-        elif nontrivial:
-            conf = 0.85
-        else:
-            conf = 0.75
+        if has_code or nontrivial or BREADTH_SIGNAL.search(lower):
+            # Code-bearing, multi-file/long, or breadth-signalled complex work
+            # (e.g. "redesign the whole architecture") stays on Opus.
+            conf = 0.92 if has_code else 0.85
+            return {
+                "tier": "complex",
+                "model": "opus",
+                "effort": "high",
+                "confidence": conf,
+                "source": "heuristic",
+                "reasoning": "complex task verb (refactor/implement/migrate/etc.)",
+            }
+        # Balanced rebalance: light, single-surface complex work goes to
+        # Sonnet 5 (now the Claude Code default, ~2x cheaper). The router-sonnet
+        # worker escalates via `Stopped:` if it discovers real depth.
         return {
             "tier": "complex",
-            "model": "opus",
-            "effort": "high",
-            "confidence": conf,
+            "model": "sonnet",
+            "effort": "medium",
+            "confidence": 0.82,
             "source": "heuristic",
-            "reasoning": "complex task verb (refactor/implement/migrate/etc.)",
+            "reasoning": "light single-surface complex verb; Sonnet 5 (escalates if deep)",
         }
     if (
         words <= 12
@@ -370,7 +390,7 @@ def classify_haiku(prompt: str) -> dict | None:
         "tier, model, effort, confidence, reasoning. "
         "tier in {trivial,standard,complex,deep}. "
         "model maps tier: trivial->haiku, standard->sonnet, complex->opus, deep->opus. "
-        "effort maps tier: trivial->low, standard->medium, complex->high, deep->xhigh. "
+        "effort maps tier: trivial->low, standard->medium, complex->high, deep->high. "
         "confidence is a number 0-1. reasoning is one sentence, max 20 words."
     )
     payload = {

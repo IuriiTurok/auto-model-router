@@ -38,6 +38,7 @@ log. Sibling: `plan-with-models` (Branch D).
 ## Inputs / Outputs / Dependencies
 
 **Inputs**
+
 - A `<router-decision>` JSON block injected by the `UserPromptSubmit` hook
   (`hooks/auto-router.py`) — fields enumerated under [Decision schema](#decision-schema).
 - The parent's own context — **authoritative** for plan-mode state (the
@@ -48,6 +49,7 @@ log. Sibling: `plan-with-models` (Branch D).
   stale ⇒ behave exactly as today.
 
 **Outputs**
+
 - One of: (a) an `Agent` dispatch to a `router-<model>` subagent (Branch A/E);
   (b) `AskUserQuestion` + the chosen branch (Branch B); (c) inline execution
   (Branch C/D).
@@ -57,6 +59,7 @@ log. Sibling: `plan-with-models` (Branch D).
   `post-agent-audit.py` PostToolUse hook — the parent writes nothing for those.
 
 **Dependencies**
+
 - Upstream: `auto-router.py` (UserPromptSubmit hook) · project `.claude/router.json`
   and `~/.claude/router.json` (project bias / opt-out) · nightly Phase 5 (Bridge B
   `signal.jsonl`, advisory).
@@ -101,8 +104,8 @@ re-delegating to a worker (log outcome `continuity_inline`).
 
 `~/.claude/cache/router/signal.jsonl` is an **optional, read-only, advisory**
 input the nightly Phase-5 step appends to (realized model-outcome rows —
-`{model, task_class, verdict ∈ ok|partial|failed}`). It is a *nudge on
-classification confidence only*, never an authority:
+`{model, task_class, verdict ∈ ok|partial|failed}`). It is a _nudge on
+classification confidence only_, never an authority:
 
 - It **never** overrides the band decision tree, the same-model
   short-circuit, plan-mode parent-authority, or an explicit user override.
@@ -111,7 +114,7 @@ classification confidence only*, never an authority:
   the decision block's own `band` / `confidence`. Never block on a read.
 - When present and fresh, treat a recent run of `failed` verdicts for the
   suggested `model` at this task class as a weak reason to lean toward the
-  next tier up on a *borderline* `auto`/`ask` confidence — but only within
+  next tier up on a _borderline_ `auto`/`ask` confidence — but only within
   the band the decision tree already chose. Do not flip `none`→`auto`, do
   not skip an `ask` confirmation, and do not change which branch runs.
 - The authoritative consumer is `router_loop.py` (it folds `signal.jsonl`
@@ -138,8 +141,9 @@ context.
 
 **Same-model short-circuit (second check).** If the suggested model is the
 model this session is already running on (an `opus` suggestion while you run
-Opus or another opus-class model counts), dispatching saves nothing and adds
-latency — stay inline. On `auto` band, log outcome `same_model_inline` (see
+Opus or another opus-class model counts; a `sonnet` suggestion while you run
+Sonnet 5 — now the Claude Code default — likewise counts), dispatching saves
+nothing and adds latency — stay inline. On `auto` band, log outcome `same_model_inline` (see
 Outcome logging). On `ask` band, skip the question and log
 `user_choice: "auto_inline_same_model"` to overrides.jsonl (Branch B step 3
 format). Every recorded ask-band override to date picked Stay-on-current in
@@ -366,21 +370,24 @@ This skill's **routing** loop is already self-improving via `router_loop.py`
 duplicate or hand-tune that here — it owns thresholds, project bias, and the
 KEEP/REVERT decisions.
 
-The lightweight block below is **only** for *non-routing* gotchas — operational
+The lightweight block below is **only** for _non-routing_ gotchas — operational
 or usage snags this skill hits that the KPI loop can't see (a wrong path, a
 `jq`/`python` fallback quirk, an `AskUserQuestion`/dispatch interaction, etc.).
 Resolve the lessons file once, first hit wins:
-1. `<project>/.claude/lessons/auto-model-routing.md`  (preferred when inside a project)
-2. `<this-skill-dir>/LESSONS.md`           (fallback when there is no project context)
+
+1. `<project>/.claude/lessons/auto-model-routing.md` (preferred when inside a project)
+2. `<this-skill-dir>/LESSONS.md` (fallback when there is no project context)
 
 **At run START (read-only, fail-open):**
+
 - Read the lessons file(s) that exist (load both if both do). If none exist, continue silently.
 - Read only the last ~20 lines; treat each `- YYYY-MM-DD …` line as a standing constraint for this run.
 - Never block on a missing file; absence just means "no lessons yet".
 
 **At run END (append, only when warranted):**
-- Append a lesson **only if** this run produced a *correction* (the user fixed/redirected your output),
-  a *gotcha* (a non-obvious failure you had to work around), or a *durable insight* worth reusing.
+
+- Append a lesson **only if** this run produced a _correction_ (the user fixed/redirected your output),
+  a _gotcha_ (a non-obvious failure you had to work around), or a _durable insight_ worth reusing.
   Routine successful runs append nothing — keep the file high-signal. Routing-quality
   signals belong in `audit.jsonl`, not here.
 - One physical line, exact format:
@@ -403,11 +410,11 @@ and `replay_kpi.py` (offline counterfactual re-banding).
 
 Each tier maps to a pre-registered subagent type:
 
-| Model  | subagent_type   | Use for                                                            |
-| ------ | --------------- | ------------------------------------------------------------------ |
-| haiku  | `router-haiku`  | Reads, lists, lookups, quick edits, classifications                             |
-| sonnet | `router-sonnet` | Routine refactors, doc writing, spec edits, prototype iteration                 |
-| opus   | `router-opus`   | Deep refactors, architecture, hard debugging, multi-file synthesis              |
+| Model  | subagent_type   | Use for                                                                                |
+| ------ | --------------- | -------------------------------------------------------------------------------------- |
+| haiku  | `router-haiku`  | Reads, lists, lookups, quick edits, classifications                                    |
+| sonnet | `router-sonnet` | Routine refactors, doc writing, spec edits, prototype iteration                        |
+| opus   | `router-opus`   | Deep refactors, architecture, hard debugging, multi-file synthesis                     |
 | fable  | `router-fable`  | Frontier-stakes synthesis, irreversible high-blast-radius steps (manual/override-only) |
 
 The dispatched agent inherits the parent's working directory and

@@ -4,9 +4,9 @@
 {"label":"trivial-where","prompt":"where is the config loaded?","expect":{"tier":"trivial","model":"haiku","effort":"low","conf_min":0.95,"band":"auto"}}
 {"label":"trivial-find","prompt":"find references to FooBar","expect":{"tier":"trivial","model":"haiku","effort":"low","conf_min":0.90,"band":"auto"}}
 {"label":"trivial-summarise-q","prompt":"summarise yesterday's commits?","expect":{"tier":"trivial","model":"haiku","effort":"low","conf_min":0.95,"band":"auto"}}
-{"label":"complex-short","prompt":"refactor the rate limiter","expect":{"tier":"complex","model":"opus","conf_min":0.0,"band":"ask"}}
+{"label":"complex-short","prompt":"refactor the rate limiter","expect":{"tier":"complex","model":"sonnet","conf_min":0.0,"band":"auto"}}
 {"label":"complex-with-code","prompt":"refactor this function:\n```python\ndef foo(x):\n    if x: return 1\n    return 0\n```\nto remove the branch","expect":{"tier":"complex","model":"opus","conf_min":0.80,"band":"auto"}}
-{"label":"complex-migration","prompt":"please migrate the user table to Postgres","expect":{"tier":"complex","model":"opus","conf_min":0.0,"band":"ask"}}
+{"label":"complex-migration","prompt":"please migrate the user table to Postgres","expect":{"tier":"complex","model":"sonnet","conf_min":0.0,"band":"auto"}}
 {"label":"deep-design-long","prompt":"design a new auth flow that supports SSO, magic links, and passkeys across api/auth.py, ui/login.tsx, and tests/test_auth.py — include the migration story and a rollback plan","expect":{"tier":"deep","model":"opus","conf_min":0.85,"band":"auto"}}
 {"label":"deep-plan-short","prompt":"plan the migration","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"ask"}}
 {"label":"deep-audit","prompt":"audit the payment module for security issues","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"ask"}}

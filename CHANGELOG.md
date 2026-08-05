@@ -3,6 +3,39 @@
 All notable changes to auto-model-router. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is semver-ish.
 
+## [0.6.0] — 2026-08-05
+
+### Changed
+
+- **Claude 5 family alignment.** Worker model targeting is unchanged — bare
+  aliases (`opus`/`sonnet`/`haiku`/`fable`) already resolve to Opus 5 / Sonnet 5
+  / Haiku 4.5 / Fable 5 — so this release updates calibration, prose, and worker
+  guidance, not model IDs. Prose refreshed: `router-opus` "Opus 4.8 → Opus 5";
+  `router-sonnet` "Sonnet 4.6 → Sonnet 5 (now the Claude Code default)".
+- **Effort philosophy `deep→high`.** Adopted Opus 5's "start at `high`, reserve
+  `xhigh`" in `classify_heuristic`, `classify_haiku`, and the `router` agent.
+  `score_effort` still promotes genuinely heavy work to `xhigh`. Net effect:
+  high-signal deep prompts stop being confidence-capped into the `ask` band (the
+  dominant ask-band friction in the audit).
+- **Balanced rebalance toward Sonnet 5.** Light, single-surface `complex` verbs
+  (no code block, not multi-file/long) now route `sonnet/medium` instead of
+  `opus/high`; `router-sonnet` escalates via `Stopped:` on real depth. `has_code`
+  / multi-file complex work stays on Opus.
+- **Worker prompt-guide updates.** `router-opus` no longer mandates a blanket
+  verification pass (Opus 5 self-verifies) and caps self-delegation; `router-
+  sonnet` notes literal instruction-following; `router-fable` gains
+  "act-when-you-have-enough", progress-grounding, no-reasoning-echo, and
+  refusal-fallback notes (Opus 5 / Fable 5 prompting guides).
+- **`CLASSIFIER_VERSION` 5 → 6** to expire cached decisions from the old
+  philosophy. `pricing.py` docstring updated to the 5.x era (rates unchanged —
+  already correct for Claude 5).
+
+### Fixed
+
+- **`router-fable` dispatch gap.** Added the missing
+  `~/.claude/agents/router-fable.md` symlink (the other three workers were
+  already linked), so `#model=fable` and plan-wave `Model: fable` can dispatch.
+
 ## [0.5.0] — 2026-06-11
 
 ### Added
