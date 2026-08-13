@@ -1,8 +1,18 @@
 {
   "name": "auto-model-router",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Per-prompt model routing for Claude Code. Heuristic + Haiku classifier picks the right model tier and effort; high-confidence prompts auto-delegate to a worker subagent. Plan-mode and multi-part prompts fan out into parallel waves with file-conflict safety. Goal-anchored: a usage report scores cost saved, user-correction rate, and time-to-results.",
   "author": {
     "name": "iuriiturok"
-  }
+  },
+  "homepage": "https://github.com/IuriiTurok/auto-model-router",
+  "repository": "https://github.com/IuriiTurok/auto-model-router",
+  "license": "MIT",
+  "keywords": [
+    "model-routing",
+    "cost-optimization",
+    "subagents",
+    "parallel-execution",
+    "hooks"
+  ]
 }

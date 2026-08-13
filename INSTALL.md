@@ -112,6 +112,13 @@ The hook walks up from your `cwd` looking for the first
 
 ## Manual / non-marketplace install
 
+> **Mutually exclusive with steps 1–2 above.** Apply this _only_ if you cloned the
+> repo directly and never ran `/plugin install`. Running both wiring paths at once
+> fires all three hooks twice per event and loads every skill, agent, and command
+> twice (once namespaced `auto-model-router:*`, once bare). If you are migrating
+> from a manual install to the marketplace install, remove these hook entries and
+> symlinks first.
+
 If you wire the plugin by hand instead of via the marketplace (e.g. you
 cloned the repo straight into `~/.claude/plugins/auto-model-router/`), you
 must replicate everything the marketplace would auto-load. **`hooks/hooks.json`
@@ -149,7 +156,7 @@ ln -sf ~/.claude/plugins/auto-model-router/skills/plan-with-models     ~/.claude
 for m in haiku sonnet opus fable; do
   ln -sf ~/.claude/plugins/auto-model-router/agents/router-$m.md ~/.claude/agents/router-$m.md
 done
-for c in route route-status router-report; do
+for c in route route-status router-report router-loop; do
   ln -sf ~/.claude/plugins/auto-model-router/commands/$c.md ~/.claude/commands/$c.md
 done
 ```

@@ -30,14 +30,20 @@ inline when the user is mid-iteration.
 
 ## Install
 
-See [INSTALL.md](INSTALL.md). TL;DR:
-
 ```
-/plugin marketplace add <owner>/auto-model-router
+/plugin marketplace add IuriiTurok/auto-model-router
 /plugin install auto-model-router@auto-model-router-mp
 ```
 
-Then optionally run `bin/install.sh` to add the `cc-route` CLI to PATH.
+Restart Claude Code (or run `/reload-plugins`). That's the whole install — the
+hooks, skills, agents, and commands all load from the plugin, and `bin/cc-route`
+is added to PATH automatically while the plugin is enabled.
+
+> **Do not also apply the "Manual / non-marketplace install" section of
+> [INSTALL.md](INSTALL.md).** It wires the same three hooks by absolute path in
+> `~/.claude/settings.json` and symlinks the components into `~/.claude/`. Doing both
+> at once fires every hook twice and duplicates every skill, agent, and command.
+> It exists only for people who cloned the repo directly instead of installing it.
 
 ## How it works
 
@@ -154,16 +160,16 @@ No manual `settings.json` edit needed.
 
 ## Knobs
 
-| Mechanism                          | Effect                                                                                                               |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `#noshift` in the prompt           | Skip routing entirely for this prompt (opt-out, `tier=optout`).                                                      |
-| `#noroute` in the prompt           | Alias for `#noshift`.                                                                                                |
-| `#model=opus` (or sonnet/haiku/fable) | Force-route to that tier; confidence 1.0, band=auto.                                                              |
-| Env `CC_ROUTER_DISABLE=1`          | Disable the hook globally for the shell.                                                                             |
-| Env `CC_ROUTER_AUTO_THRESHOLD=0.9` | Raise/lower the auto-delegate cutoff (default 0.75).                                                                 |
-| Env `CC_ROUTER_ASK_THRESHOLD=0.6`  | Raise/lower the ask cutoff (default 0.60).                                                                           |
-| Env `ANTHROPIC_API_KEY`            | Enables the Haiku fallback classifier for ambiguous cases. Without it, low-confidence prompts default to Sonnet/ask. |
-| Project `.claude/router.json`      | Per-project overrides (see below). Found by walking up from `cwd`.                                                   |
+| Mechanism                             | Effect                                                                                                               |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `#noshift` in the prompt              | Skip routing entirely for this prompt (opt-out, `tier=optout`).                                                      |
+| `#noroute` in the prompt              | Alias for `#noshift`.                                                                                                |
+| `#model=opus` (or sonnet/haiku/fable) | Force-route to that tier; confidence 1.0, band=auto.                                                                 |
+| Env `CC_ROUTER_DISABLE=1`             | Disable the hook globally for the shell.                                                                             |
+| Env `CC_ROUTER_AUTO_THRESHOLD=0.9`    | Raise/lower the auto-delegate cutoff (default 0.75).                                                                 |
+| Env `CC_ROUTER_ASK_THRESHOLD=0.6`     | Raise/lower the ask cutoff (default 0.60).                                                                           |
+| Env `ANTHROPIC_API_KEY`               | Enables the Haiku fallback classifier for ambiguous cases. Without it, low-confidence prompts default to Sonnet/ask. |
+| Project `.claude/router.json`         | Per-project overrides (see below). Found by walking up from `cwd`.                                                   |
 
 ### Per-project overrides — `.claude/router.json`
 

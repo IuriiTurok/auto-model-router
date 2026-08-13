@@ -11,6 +11,7 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.ruff_cache/
 
 # Local-only debug/test cache (audit log + classification cache live
 # in ~/.claude/cache/router/, never inside the plugin folder, so they

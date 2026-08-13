@@ -23,7 +23,7 @@ All notable changes to auto-model-router. Format loosely follows
   / multi-file complex work stays on Opus.
 - **Worker prompt-guide updates.** `router-opus` no longer mandates a blanket
   verification pass (Opus 5 self-verifies) and caps self-delegation; `router-
-  sonnet` notes literal instruction-following; `router-fable` gains
+sonnet` notes literal instruction-following; `router-fable` gains
   "act-when-you-have-enough", progress-grounding, no-reasoning-echo, and
   refusal-fallback notes (Opus 5 / Fable 5 prompting guides).
 - **`CLASSIFIER_VERSION` 5 → 6** to expire cached decisions from the old
@@ -35,6 +35,22 @@ All notable changes to auto-model-router. Format loosely follows
 - **`router-fable` dispatch gap.** Added the missing
   `~/.claude/agents/router-fable.md` symlink (the other three workers were
   already linked), so `#model=fable` and plan-wave `Model: fable` can dispatch.
+
+### Packaging
+
+- **Manifest brought to catalog quality for marketplace submission.** `plugin.json`
+  version corrected to `0.6.0` (it had been left at `0.5.0` while the changelog
+  already declared 0.6.0) and given `homepage`, `repository`, `license`, and
+  `keywords`. The marketplace entry gains `version`, `tags`, and `license`, and its
+  description is cut from a component inventory to a two-sentence catalog card.
+  Both manifests pass `claude plugin validate --strict`.
+- **Marketplace install documented as the only supported path.** README leads with
+  `/plugin marketplace add IuriiTurok/auto-model-router` and warns that the manual
+  wiring section of INSTALL.md is mutually exclusive with it — applying both fires
+  all three hooks twice and loads every component twice.
+- **`router-loop` added to the manual symlink loop** in INSTALL.md; it shipped in
+  `commands/` but was never linked, so `/router-loop` was dead on manual installs.
+- `.ruff_cache/` gitignored.
 
 ## [0.5.0] — 2026-06-11
 
