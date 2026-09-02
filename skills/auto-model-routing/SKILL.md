@@ -96,9 +96,12 @@ mode reliably. Trust your own context over this field (see Procedure).
 `tier == "optout"` means the user or project config has opted out of routing
 entirely for this prompt (`#noshift`, `#noroute`, or `"disabled": true`); treat
 it as `band == "none"` and proceed inline.
-`continuity: true` means the classifier detected that this prompt is a
-follow-up on an in-progress task — prefer staying inline rather than
-re-delegating to a worker (log outcome `continuity_inline`).
+`continuity` (an object `{"turns": N}`, or absent) means you are several turns
+into the session, so this prompt is most likely a follow-up on the work in
+progress. The hook already downgrades a would-be `ask` to silent inline in this
+case — mid-session you simply get no decision block and are not interrupted.
+When `continuity` rides along on an `auto` decision, still prefer staying inline
+rather than re-delegating to a worker (log outcome `continuity_inline`).
 
 ### Advisory signal (Bridge B — fail-open, subordinate)
 
@@ -147,7 +150,9 @@ nothing and adds latency — stay inline. On `auto` band, log outcome `same_mode
 Outcome logging). On `ask` band, skip the question and log
 `user_choice: "auto_inline_same_model"` to overrides.jsonl (Branch B step 3
 format). Every recorded ask-band override to date picked Stay-on-current in
-exactly this situation.
+exactly this situation, so treat a same-model suggestion as an automatic no-op
+and never raise a question for it — the hook cannot see your session model, so
+this short-circuit is yours to enforce.
 
 ### Branch A — `band == "auto"`
 
@@ -260,6 +265,14 @@ Every `auto`-band decision must end as exactly ONE of:
 - a skip row you append, using ONLY this vocabulary:
   `skipped_trivial` | `same_model_inline` | `continuity_inline` |
   `worker_failed`.
+
+**Backstop (automatic).** A `Stop` hook (`hooks/reconcile-outcomes.py`) now
+appends `auto_inline_unattributed` for any of this session's `auto` decisions
+that end a turn with no `delegated` row and no skip row. It exists so the
+follow-through metric stays honest even when a skip row is forgotten — a safety
+net, not a licence to stop logging: a precise `same_model_inline` /
+`skipped_trivial` / `continuity_inline` row is still better signal than the
+generic backstop.
 
 ```bash
 echo "$(jq -nc --arg id "<decision_id>" --arg outcome "<OUTCOME>" --arg model "<model>" '{ts: (now|todate), decision_id: $id, outcome: $outcome, model: $model}')" >> ~/.claude/cache/router/audit.jsonl

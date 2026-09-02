@@ -11,7 +11,11 @@ import subprocess
 import sys
 import tempfile
 
-HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "auto-router.py")
+HOOK = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "hooks",
+    "auto-router.py",
+)
 
 
 def _run_hook(payload: dict, cache_dir: str) -> tuple[str, int]:
@@ -71,9 +75,9 @@ with tempfile.TemporaryDirectory() as cache_dir:
         and last_decision.get("continuity", {}).get("turns") == 6,
     )
     check(
-        "6th turn: thresholds.auto == 0.85 (0.75 + 0.10 bump)",
+        "6th turn: thresholds.auto == 0.75 (continuity no longer bumps the threshold)",
         last_decision is not None
-        and abs(last_decision.get("thresholds", {}).get("auto", 0) - 0.85) < 1e-9,
+        and abs(last_decision.get("thresholds", {}).get("auto", 0) - 0.75) < 1e-9,
     )
 
 # ---------------------------------------------------------------------------
@@ -87,6 +91,56 @@ with tempfile.TemporaryDirectory() as cache_dir:
     check(
         "no session_id: sessions/ dir absent",
         not os.path.isdir(sessions_dir),
+    )
+
+# ---------------------------------------------------------------------------
+# Test 3: mid-session, a would-be ask-band prompt is downgraded to silent
+# inline (Branch C) instead of interrupting. Force the ask band with env
+# thresholds (auto=0.99, ask=0.10) so a plain standard prompt lands in ask,
+# then confirm turn 1 asks but turn 6 (continuity) goes silent.
+# ---------------------------------------------------------------------------
+with tempfile.TemporaryDirectory() as cache_dir:
+    session_id = "test-continuity-session-002"
+    prompt = "update the readme with the new setup steps"
+    env = {
+        **os.environ,
+        "CC_ROUTER_CACHE_DIR": cache_dir,
+        "CC_ROUTER_AUTO_THRESHOLD": "0.99",
+        "CC_ROUTER_ASK_THRESHOLD": "0.10",
+    }
+
+    def _run_env(payload: dict) -> str:
+        return subprocess.run(
+            [sys.executable, HOOK],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+        ).stdout
+
+    payload = {"prompt": prompt, "cwd": "/tmp", "session_id": session_id}
+    first_decision = _extract_decision(_run_env(payload))  # turn 1: fresh -> ask
+    last_stdout = ""
+    for _ in range(5):  # turns 2..6
+        last_stdout = _run_env(payload)
+    last_decision = _extract_decision(last_stdout)
+
+    check(
+        "turn 1 (fresh) is ask band",
+        first_decision is not None and first_decision.get("band") == "ask",
+    )
+    check(
+        "turn 6 (continuity) downgraded to silent inline (no decision block)",
+        last_decision is None and last_stdout.strip() == "",
+    )
+    audit_path = os.path.join(cache_dir, "audit.jsonl")
+    audit_rows = []
+    if os.path.exists(audit_path):
+        with open(audit_path) as f:
+            audit_rows = [json.loads(x) for x in f if x.strip()]
+    check(
+        "downgraded turn logged outcome=continuity_inline",
+        any(r.get("outcome") == "continuity_inline" for r in audit_rows),
     )
 
 print(f"--- continuity: {'OK' if FAIL == 0 else f'{FAIL} FAILED'}")

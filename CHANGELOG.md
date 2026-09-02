@@ -3,6 +3,44 @@
 All notable changes to auto-model-router. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is semver-ish.
 
+## [0.7.0] — 2026-09-02
+
+Autonomy pass: cut the ask-band interrupt rate and heal the outcome log. Driven
+by 113 days of audit data (7,153 events) — asks were ~24% of prompts, 78% of
+them from repos with no `.claude/router.json`, and outcome logging had gone
+dormant for the 3rd time.
+
+### Changed
+
+- **Opus auto-floor `0.90 → 0.85`** (`MODEL_TIERS["opus"]["auto_floor"]`). The
+  legacy floor forced ~1 in 3 deep/design prompts into `ask` at confidence 0.85
+  even though the parent was usually already on Opus. 0.85 keeps some asymmetric
+  caution while auto-routing the high-value deep work.
+- **Continuity now suppresses the interrupt instead of causing it.** The old
+  `+0.1` auto-threshold bump perversely pushed mid-session standard prompts INTO
+  the ask band. Removed the bump; instead, once a session is 5+ turns deep a
+  would-be `ask` is downgraded to a silent inline turn (Branch C), logged
+  `continuity_inline`.
+- **`CLASSIFIER_VERSION` 6 → 7** to expire cached decisions under the new bands.
+- **Trimmed the injected `#model=`/`#noshift` override footer** — zero real uses
+  across ~113 days of audit; it only added per-prompt tokens.
+
+### Added
+
+- **`hooks/reconcile-outcomes.py` (Stop hook).** Deterministically backstops the
+  outcome log: for each of this session's injected `auto` decisions with no
+  `delegated`/skip row, appends `auto_inline_unattributed`. Fixes the recurring
+  dormant-instrumentation problem (skip logging had drifted to ~3%). Correlated
+  by a new `session_id` field stamped onto injected/silent audit rows. Fail-open
+  and idempotent.
+
+### Notes
+
+- Pairs with enriched `~/.claude/router.json` + a new `claude-os` overlay
+  (`default_model` + deep-verb→opus rules that clear the floor via rule
+  confidence 0.95, + lookup→haiku). Those live in the user's config, not the
+  plugin.
+
 ## [0.6.0] — 2026-08-05
 
 ### Changed

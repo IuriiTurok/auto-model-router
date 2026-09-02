@@ -85,7 +85,7 @@ def propose_threshold(
 ) -> float | None:
     """Propose lowering auto_threshold by one step if there is enough reclaimable
     ask-band mass — non-opus decisions currently asked whose confidence would be
-    auto under the new threshold. Opus is excluded (it keeps a 0.90 floor).
+    auto under the new threshold. Opus is excluded (it keeps a 0.85 floor).
     Returns the new threshold, or None if there's no sensible move."""
     new = round(current_auto - step, 4)
     if new < floor:

@@ -63,7 +63,7 @@ fail += _check(
     rl.propose_threshold(0.66, reclaimable, step=0.05, floor=0.65, min_mass=5) is None,
 )
 fail += _check(
-    "propose: opus ask mass is NOT reclaimable (0.90 floor) -> None",
+    "propose: opus ask mass is NOT reclaimable (0.85 floor) -> None",
     rl.propose_threshold(
         0.75, [_mk(0.72, "opus", "ask")] * 8, step=0.05, floor=0.65, min_mass=5
     )
@@ -71,11 +71,23 @@ fail += _check(
 )
 
 # --- thresholds_valid (structural safety net for forced/override candidates) ---
-fail += _check("thresholds valid: 0.72 > 0.60 in-band", rl.thresholds_valid(0.72, 0.60) is True)
-fail += _check("thresholds valid: at floor 0.65 ok", rl.thresholds_valid(0.65, 0.60) is True)
-fail += _check("thresholds invalid: 0.30 below floor & < ask", rl.thresholds_valid(0.30, 0.60) is False)
-fail += _check("thresholds invalid: auto <= ask inverts bands", rl.thresholds_valid(0.55, 0.60) is False)
-fail += _check("thresholds invalid: above ceiling", rl.thresholds_valid(0.99, 0.60) is False)
+fail += _check(
+    "thresholds valid: 0.72 > 0.60 in-band", rl.thresholds_valid(0.72, 0.60) is True
+)
+fail += _check(
+    "thresholds valid: at floor 0.65 ok", rl.thresholds_valid(0.65, 0.60) is True
+)
+fail += _check(
+    "thresholds invalid: 0.30 below floor & < ask",
+    rl.thresholds_valid(0.30, 0.60) is False,
+)
+fail += _check(
+    "thresholds invalid: auto <= ask inverts bands",
+    rl.thresholds_valid(0.55, 0.60) is False,
+)
+fail += _check(
+    "thresholds invalid: above ceiling", rl.thresholds_valid(0.99, 0.60) is False
+)
 
 print(f"--- router_loop helpers: {'OK' if fail == 0 else f'{fail} FAILED'}")
 sys.exit(1 if fail else 0)

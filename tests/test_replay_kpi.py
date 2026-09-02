@@ -8,7 +8,10 @@ drift between the replay and the live hook.
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"),
+)
 
 import replay_kpi
 
@@ -44,7 +47,8 @@ decs = [
 ]
 fail += _check(
     "identity: own-threshold replay == recorded distribution",
-    replay_kpi.reband_with_own_thresholds(decs, BF) == replay_kpi.recorded_distribution(decs),
+    replay_kpi.reband_with_own_thresholds(decs, BF)
+    == replay_kpi.recorded_distribution(decs),
 )
 
 # Counterfactual: a sonnet decision at conf 0.75 (auto under 0.75) falls to ask
@@ -56,11 +60,15 @@ fail += _check(
     dist.get("ask") == 1 and dist.get("auto", 0) == 0,
 )
 
-# Model-aware opus floor: opus at conf 0.85 stays in ask even at auto=0.75
-# (opus keeps a 0.90 floor).
+# Model-aware opus floor (v0.7.0): opus at conf 0.85 now AUTO-routes at
+# auto=0.75 because the opus floor was lowered 0.90 -> 0.85; opus below 0.85
+# is still gated to ask.
 opus = [_mk(0.85, "opus", 0.75, 0.60)]
 dist2 = replay_kpi.reband_distribution(opus, 0.75, 0.60, BF)
-fail += _check("opus floor: 0.85 opus stays ask at auto=0.75", dist2.get("ask") == 1)
+fail += _check("opus floor: 0.85 opus autos at auto=0.75 (floor lowered to 0.85)", dist2.get("auto") == 1)
+opus_below = [_mk(0.80, "opus", 0.75, 0.60)]
+dist2b = replay_kpi.reband_distribution(opus_below, 0.75, 0.60, BF)
+fail += _check("opus floor: 0.80 opus still gated to ask (below 0.85 floor)", dist2b.get("ask") == 1)
 
 # Distribution counts sum to the number of decisions.
 dist3 = replay_kpi.reband_distribution(decs, 0.75, 0.60, BF)
