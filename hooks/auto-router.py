@@ -10,7 +10,7 @@ Behaviour:
     ~/.claude/cache/router/.
   - Confidence bands -> band field:
       auto   if confidence >= AUTO_THRESHOLD  (default 0.75; opus picks
-             keep a 0.90 floor — see band_for())
+             keep a 0.85 floor — see band_for())
       ask    if AUTO_THRESHOLD > confidence >= ASK_THRESHOLD  (default 0.60)
       none   otherwise (silent)
   - Effort (low/medium/high/xhigh) is scored independently from tier; when
@@ -50,7 +50,7 @@ PROJECT_CONFIG_FILENAME = ".claude/router.json"
 
 # Bumped whenever classifier output or thresholds change; cache_get treats
 # entries with a different version as a miss so old entries naturally expire.
-CLASSIFIER_VERSION = 6
+CLASSIFIER_VERSION = 7
 
 # Canonical model tier table. effort is the tier's default effort; agent is the
 # router-<model> subagent; auto_routable is False for tiers the classifier may
@@ -73,7 +73,7 @@ MODEL_TIERS = {
         "effort": "high",
         "agent": "router-opus",
         "auto_routable": True,
-        "auto_floor": 0.90,
+        "auto_floor": 0.85,
     },
     "fable": {
         "effort": "xhigh",
@@ -484,7 +484,7 @@ def band_for(
 ) -> str:
     # Asymmetric risk: misrouting to opus is the expensive failure mode, so
     # opus picks need a higher confidence floor than cheaper models. The floor
-    # comes from MODEL_TIERS[model]["auto_floor"] (opus pins the legacy 0.90);
+    # comes from MODEL_TIERS[model]["auto_floor"] (opus pins 0.85);
     # models with no floor use auto_threshold.
     floor = MODEL_TIERS.get(model, {}).get("auto_floor")
     effective_auto = max(auto_threshold, floor) if floor is not None else auto_threshold
@@ -679,27 +679,35 @@ def main() -> int:
     ):
         result["model"] = "opus"
 
-    # Session continuity: deeper into a session, nudge the auto threshold up so
-    # the router is a touch more conservative about auto-dispatching. Only when
-    # the payload carries a session_id — otherwise complete no-op (no sessions/
-    # dir is created).
+    # Session continuity: once the user is several turns into a session, an
+    # ambiguous (ask-band) prompt is almost always a follow-up on the work in
+    # progress, so interrupting to ask "which model?" breaks the flow. The old
+    # behaviour nudged the auto threshold UP, which perversely pushed these
+    # prompts INTO the ask band. Instead we band on the normal threshold and,
+    # when continuity is detected, downgrade a would-be `ask` to a silent inline
+    # turn (Branch C). Only fires when the payload carries a session_id.
     continuity = None
-    effective_auto_threshold = auto_threshold
     session_id = payload.get("session_id")
     if session_id:
         turns = session_bump(str(session_id))
         if turns >= int(os.environ.get("CC_ROUTER_CONTINUITY_TURNS", "5")):
-            effective_auto_threshold = auto_threshold + 0.1
-            continuity = {"turns": turns, "bump": 0.1}
+            continuity = {"turns": turns}
 
     plan_mode = detect_plan_mode(payload)
     fanout, fanout_hint = detect_fanout(prompt)
     band = band_for(
         float(result.get("confidence", 0)),
-        effective_auto_threshold,
+        auto_threshold,
         ask_threshold,
         result.get("model", ""),
     )
+    # Continuity: keep mid-session follow-ups inline rather than interrupting.
+    if continuity is not None and band == "ask":
+        band = "none"
+        prev = result.get("reasoning", "")
+        result["reasoning"] = (
+            prev + "; " if prev else ""
+        ) + f"continuity: staying inline mid-session (turn {continuity['turns']})"
     decision_id = "r_" + uuid.uuid4().hex[:10]
 
     decision = {
@@ -713,7 +721,7 @@ def main() -> int:
         "plan_mode": plan_mode,
         "fanout": fanout,
         "decision_id": decision_id,
-        "thresholds": {"auto": effective_auto_threshold, "ask": ask_threshold},
+        "thresholds": {"auto": auto_threshold, "ask": ask_threshold},
         "project_config": project_cfg.get("_source"),
     }
     if continuity is not None:
@@ -727,8 +735,9 @@ def main() -> int:
             {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
+                "session_id": session_id,
                 "decision": decision,
-                "outcome": "silent",
+                "outcome": "continuity_inline" if continuity is not None else "silent",
             }
         )
         return 0
@@ -801,14 +810,14 @@ def main() -> int:
         f"{instruction}\n\n"
         "<router-decision>\n"
         f"{json.dumps(decision)}\n"
-        "</router-decision>\n"
-        "(Override: `#model=opus|sonnet|haiku`. Suppress: `#noshift`.)"
+        "</router-decision>"
     )
 
     audit_append(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
             "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
+            "session_id": session_id,
             "decision": decision,
             "outcome": "injected",
         }

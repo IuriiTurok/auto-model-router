@@ -8,9 +8,9 @@
 {"label":"complex-with-code","prompt":"refactor this function:\n```python\ndef foo(x):\n    if x: return 1\n    return 0\n```\nto remove the branch","expect":{"tier":"complex","model":"opus","conf_min":0.80,"band":"auto"}}
 {"label":"complex-migration","prompt":"please migrate the user table to Postgres","expect":{"tier":"complex","model":"sonnet","conf_min":0.0,"band":"auto"}}
 {"label":"deep-design-long","prompt":"design a new auth flow that supports SSO, magic links, and passkeys across api/auth.py, ui/login.tsx, and tests/test_auth.py — include the migration story and a rollback plan","expect":{"tier":"deep","model":"opus","conf_min":0.85,"band":"auto"}}
-{"label":"deep-plan-short","prompt":"plan the migration","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"ask"}}
-{"label":"deep-audit","prompt":"audit the payment module for security issues","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"ask"}}
-{"label":"deep-investigate-short","prompt":"investigate why the worker pool keeps stalling under load","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"ask"}}
+{"label":"deep-plan-short","prompt":"plan the migration","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"auto"}}
+{"label":"deep-audit","prompt":"audit the payment module for security issues","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"auto"}}
+{"label":"deep-investigate-short","prompt":"investigate why the worker pool keeps stalling under load","expect":{"tier":"deep","model":"opus","conf_min":0.0,"band":"auto"}}
 {"label":"standard-readme","prompt":"can you update the readme with the new install steps and bump the version","expect":{"tier":"standard","model":"sonnet","conf_min":0.0,"band":"auto"}}
 {"label":"standard-docs","prompt":"add a section to the docs about the new feature flag","expect":{"tier":"standard","model":"sonnet","conf_min":0.0,"band":"auto"}}
 {"label":"override-opus","prompt":"#model=opus list the open PRs","expect":{"tier":"override","model":"opus","effort":"high","conf_min":1.0,"band":"auto"}}
