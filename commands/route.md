@@ -1,10 +1,10 @@
 ---
-description: Force a re-classification of a prompt by the auto-router (bypasses the 7-day cache). Useful when rules were tweaked or the cached decision is stale. Usage `/route <prompt>` or `/route --show-last` to print the most recent decision.
+description: Run the auto-router classifier on a prompt and show its decision. Useful when rules were tweaked and you want to see how a prompt classifies now. Usage `/route <prompt>` or `/route --show-last` to print the most recent decision.
 ---
 
 # /route
 
-Re-run the auto-router classifier on a prompt without using the cache.
+Run the auto-router classifier on a prompt and show its decision.
 
 ## Usage
 
@@ -15,19 +15,15 @@ Re-run the auto-router classifier on a prompt without using the cache.
 When invoked:
 
 1. Read the user's `<prompt>` argument.
-2. Run the auto-router classifier on it. The classifier script lives at
+2. Run the auto-router classifier on it. The classifier is a pure
+   heuristic (no LLM call, no cache) and lives at
    `~/.claude/plugins/auto-model-router/hooks/auto-router.py`. Pipe the
-   prompt to it as JSON with `force_recache: true`:
+   prompt to it as JSON:
 
    ```bash
    echo '{"prompt": "<prompt>"}' | \
-     CC_ROUTER_FORCE_RECACHE=1 \
      python3 ~/.claude/plugins/auto-model-router/hooks/auto-router.py
    ```
-
-   (If the script doesn't honour `CC_ROUTER_FORCE_RECACHE` yet, manually
-   delete the cache entry: `rm ~/.claude/cache/router/$(echo -n
-   "<prompt>" | shasum -a 256 | cut -d' ' -f1).json` first.)
 
 3. Parse the `<router-decision>` block from the hook's stdout JSON
    (`hookSpecificOutput.additionalContext`).

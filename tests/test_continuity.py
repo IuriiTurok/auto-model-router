@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Continuity behaviour tests for hooks/auto-router.py.
+"""Session-continuity tests for hooks/auto-router.py.
 
-Uses a temp CC_ROUTER_CACHE_DIR so it never touches the real cache.
-Exit 0 if all pass; 1 otherwise.
+Continuity is no longer a turn threshold that silences routing once a session
+gets long — it is a shape test on the prompt itself: short acknowledgements and
+back-references stay inline, everything else keeps routing however deep into
+the session it arrives. Uses a temp CC_ROUTER_CACHE_DIR so it never touches the
+real cache. Exit 0 if all pass; 1 otherwise.
 """
 
 import json
@@ -17,10 +20,21 @@ HOOK = os.path.join(
     "auto-router.py",
 )
 
+ROUTABLE_PROMPT = "refactor the auth module to use JWT tokens"
+
 
 def _run_hook(payload: dict, cache_dir: str) -> tuple[str, int]:
     """Pipe payload JSON to the hook; return (stdout, returncode)."""
-    env = {**os.environ, "CC_ROUTER_CACHE_DIR": cache_dir}
+    env = {
+        **os.environ,
+        "CC_ROUTER_CACHE_DIR": cache_dir,
+        # Nonexistent by default so this never merges in the developer's real
+        # ~/.claude/router.json.
+        "CC_ROUTER_GLOBAL_CONFIG": os.environ.get(
+            "CC_ROUTER_GLOBAL_CONFIG",
+            os.path.join(cache_dir, "no-such-global-router.json"),
+        ),
+    }
     result = subprocess.run(
         [sys.executable, HOOK],
         input=json.dumps(payload),
@@ -36,11 +50,19 @@ def _extract_decision(stdout: str) -> dict | None:
     try:
         out = json.loads(stdout)
         ctx = out["hookSpecificOutput"]["additionalContext"]
-        start = ctx.index("<router-decision>") + len("<router-decision>\n")
-        end = ctx.index("\n</router-decision>")
+        start = ctx.index("<router-decision>") + len("<router-decision>")
+        end = ctx.index("</router-decision>")
         return json.loads(ctx[start:end])
     except (json.JSONDecodeError, KeyError, ValueError):
         return None
+
+
+def _audit_rows(cache_dir: str) -> list[dict]:
+    path = os.path.join(cache_dir, "audit.jsonl")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
 
 
 PASS = 0
@@ -58,26 +80,26 @@ def check(name: str, cond: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 1: 6 turns with the same session_id → 6th decision has continuity
+# Test 1: routing survives a long session — the 6th turn still injects, and the
+# per-session turn counter tracks it.
 # ---------------------------------------------------------------------------
 with tempfile.TemporaryDirectory() as cache_dir:
     session_id = "test-continuity-session-001"
-    prompt = "refactor the auth module to use JWT tokens"
-    last_decision = None
-    for i in range(6):
-        payload = {"prompt": prompt, "cwd": "/tmp", "session_id": session_id}
-        stdout, rc = _run_hook(payload, cache_dir)
-        last_decision = _extract_decision(stdout)
+    payload = {"prompt": ROUTABLE_PROMPT, "cwd": "/tmp", "session_id": session_id}
+    last_stdout = ""
+    for _ in range(6):
+        last_stdout, _rc = _run_hook(payload, cache_dir)
 
     check(
-        "6th turn: continuity.turns == 6",
-        last_decision is not None
-        and last_decision.get("continuity", {}).get("turns") == 6,
+        "6th turn still injects (no post-turn-5 suppression)",
+        _extract_decision(last_stdout) is not None,
     )
+    with open(os.path.join(cache_dir, "sessions", f"{session_id}.json")) as f:
+        state = json.load(f)
+    check("session file counted 6 turns", state.get("turns") == 6)
     check(
-        "6th turn: thresholds.auto == 0.75 (continuity no longer bumps the threshold)",
-        last_decision is not None
-        and abs(last_decision.get("thresholds", {}).get("auto", 0) - 0.75) < 1e-9,
+        "6th audit row carries turns=6",
+        bool(_audit_rows(cache_dir)) and _audit_rows(cache_dir)[-1].get("turns") == 6,
     )
 
 # ---------------------------------------------------------------------------
@@ -94,53 +116,32 @@ with tempfile.TemporaryDirectory() as cache_dir:
     )
 
 # ---------------------------------------------------------------------------
-# Test 3: mid-session, a would-be ask-band prompt is downgraded to silent
-# inline (Branch C) instead of interrupting. Force the ask band with env
-# thresholds (auto=0.99, ask=0.10) so a plain standard prompt lands in ask,
-# then confirm turn 1 asks but turn 6 (continuity) goes silent.
+# Test 3: a short follow-up on work in flight stays inline, while the same
+# session keeps routing full prompts.
 # ---------------------------------------------------------------------------
 with tempfile.TemporaryDirectory() as cache_dir:
     session_id = "test-continuity-session-002"
-    prompt = "update the readme with the new setup steps"
-    env = {
-        **os.environ,
-        "CC_ROUTER_CACHE_DIR": cache_dir,
-        "CC_ROUTER_AUTO_THRESHOLD": "0.99",
-        "CC_ROUTER_ASK_THRESHOLD": "0.10",
-    }
-
-    def _run_env(payload: dict) -> str:
-        return subprocess.run(
-            [sys.executable, HOOK],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            env=env,
-        ).stdout
-
-    payload = {"prompt": prompt, "cwd": "/tmp", "session_id": session_id}
-    first_decision = _extract_decision(_run_env(payload))  # turn 1: fresh -> ask
-    last_stdout = ""
-    for _ in range(5):  # turns 2..6
-        last_stdout = _run_env(payload)
-    last_decision = _extract_decision(last_stdout)
-
+    routable, _rc = _run_hook(
+        {"prompt": ROUTABLE_PROMPT, "cwd": "/tmp", "session_id": session_id}, cache_dir
+    )
+    followup, _rc = _run_hook(
+        {"prompt": "ok now do that again", "cwd": "/tmp", "session_id": session_id},
+        cache_dir,
+    )
+    check("full prompt routes", _extract_decision(routable) is not None)
+    check("follow-up produces no output", followup.strip() == "")
+    rows = _audit_rows(cache_dir)
     check(
-        "turn 1 (fresh) is ask band",
-        first_decision is not None and first_decision.get("band") == "ask",
+        "follow-up logged outcome_hint=followup_inline",
+        any(r.get("outcome_hint") == "followup_inline" for r in rows),
     )
     check(
-        "turn 6 (continuity) downgraded to silent inline (no decision block)",
-        last_decision is None and last_stdout.strip() == "",
-    )
-    audit_path = os.path.join(cache_dir, "audit.jsonl")
-    audit_rows = []
-    if os.path.exists(audit_path):
-        with open(audit_path) as f:
-            audit_rows = [json.loads(x) for x in f if x.strip()]
-    check(
-        "downgraded turn logged outcome=continuity_inline",
-        any(r.get("outcome") == "continuity_inline" for r in audit_rows),
+        "follow-up row records the parent model it stayed on",
+        any(
+            r.get("outcome_hint") == "followup_inline"
+            and r["decision"]["parent"] == "opus"
+            for r in rows
+        ),
     )
 
 print(f"--- continuity: {'OK' if FAIL == 0 else f'{FAIL} FAILED'}")

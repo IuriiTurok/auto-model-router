@@ -3,7 +3,9 @@
 tool_use_id so the matching PostToolUse hook (post-agent-audit.py) can
 compute wall-clock duration.
 
-Skips non-router subagent dispatches. Idempotent and silent on any error.
+Marks every Agent dispatch (router and native subagent_types alike) so
+post-agent-audit.py can record realized usage for both. Idempotent and
+silent on any error.
 """
 
 import json
@@ -30,7 +32,7 @@ def main() -> int:
     if tool != "Agent":
         return 0
     tool_input = payload.get("toolInput") or payload.get("tool_input") or {}
-    if not (tool_input.get("subagent_type") or "").startswith("router-"):
+    if not (tool_input.get("subagent_type") or "").strip():
         return 0
     tool_use_id = payload.get("toolUseId") or payload.get("tool_use_id")
     if not tool_use_id:

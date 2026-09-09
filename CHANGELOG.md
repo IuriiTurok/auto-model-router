@@ -3,6 +3,71 @@
 All notable changes to auto-model-router. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is semver-ish.
 
+## [0.8.0] — 2026-09-09
+
+Session-aware, downhill-only routing: the hook now reads the parent session's
+own model off its transcript and only ever routes to something strictly
+cheaper, replacing the old `ask` band and its interrupt cost entirely.
+
+### Changed
+
+- **Session-aware downhill-only routing.** `read_session_state()` reads the
+  parent's current model family and context size off the tail of its own
+  transcript. `main()` injects an `AUTO-ROUTE` block only when the routed
+  model is strictly cheaper than the parent (`haiku < sonnet < opus < fable`);
+  a same-or-higher pick is audited (`outcome_hint: same_or_higher_inline`) and
+  stays silent. An explicit `#model=` override or a project rule may still
+  route up, since only the human can change the session's own model.
+- **`ask` band removed.** Two bands only — `auto` (route) / `none` (silent).
+  `band_for()` drops the `AskUserQuestion` path; the old asymmetric-risk
+  `ask_threshold` machinery is gone from the decision path (still accepted on
+  the CLI/config surface for backward compatibility and ignored).
+- **Real `permission_mode` plan detection.** Plan mode now reads
+  `payload.permission_mode == "plan"` directly instead of guessing; on a plan
+  turn the hook emits one pointer line to `plan-with-models` and nothing else.
+- **Injection compacted to under 300 characters.** The prose line carries only
+  what changes the parent's behaviour (model/effort/confidence/parent/ctx +
+  an optional fanout/budget clause); tier, source, reasoning, and thresholds
+  stay in the audit row, not the parent's context.
+- **Haiku lookups restored.** Short, unambiguous lookup phrasing
+  (`LOOKUP_VERBS` + short/no-code/few-lines) routes to `haiku` again instead
+  of defaulting everything ambiguous to Sonnet.
+- **Dead classifier-LLM + SHA cache removed.** The old Haiku-fallback
+  classifier call and its `~/.claude/cache/router/<sha256>.json` 7-day
+  classification cache are gone — the heuristic is now the only classifier,
+  and there is nothing left to invalidate on a `CLASSIFIER_VERSION` bump.
+- **`load_project_config` merges project + global `router.json` instead of
+  first-hit-wins.** A `.claude/router.json` found walking up from `cwd` now
+  layers over `~/.claude/router.json`: project scalars (`default_model`,
+  `auto_threshold`, ...) override global ones when present and fall through
+  to global otherwise; `rules` is the concatenation of project rules then
+  global rules, so a project-specific pattern is always checked before a
+  global one but a global rule still fires when the project has nothing more
+  specific. New `CC_ROUTER_GLOBAL_CONFIG` env override keeps this hermetic
+  for tests.
+- **Namespaced agent dispatch.** All worker dispatch instructions use the
+  `auto-model-router:router-<model>` form; the bare `router-<model>` name
+  fails with "Agent type not found" once installed as a plugin.
+
+### Added
+
+- **Every dispatch and inline turn now recorded with realized tokens.**
+  `post-agent-audit.py` captures realized usage (input/output/cache
+  read/cache write, `model_actual`) for both router and native `Agent`
+  dispatches; `reconcile-outcomes.py` (Stop hook) backstops turns that never
+  got an explicit outcome row, so the audit log no longer silently drops
+  inline work.
+- **Realized savings report + `--compare-days`.** `tools/usage-report.py`
+  gains a "Realized — actual $ from audit-row usage" rollup (actual spend by
+  kind × `model_actual` family) alongside the existing all-Opus counterfactual
+  estimate, plus `--compare-days N` to diff the current window against a
+  prior one of the same length.
+
+### Removed
+
+- `overrides.jsonl` and the ask-band `AskUserQuestion` confirmation step —
+  nothing writes to it anymore; see `skills/auto-model-routing/references/tooling.md`.
+
 ## [0.7.0] — 2026-09-02
 
 Autonomy pass: cut the ask-band interrupt rate and heal the outcome log. Driven

@@ -27,3 +27,5 @@
 {"label":"override-fable","prompt":"#model=fable redesign the persona isolation boundary","expect":{"tier":"override","model":"fable","effort":"xhigh","band":"auto"}}
 {"label":"deep-no-fable-auto","prompt":"redesign the whole ingestion architecture for multi-tenant isolation","expect":{"model":"opus"}}
 {"label":"ultracode-silent","prompt":"ultracode audit the entire codebase","expect":{"silent":true}}
+{"label":"followup-ack-silent","prompt":"ok now do that again","expect":{"silent":true}}
+{"label":"followup-backref-silent","prompt":"also fix the failing test","expect":{"silent":true}}

@@ -4,20 +4,22 @@ machine-readable <router-decision> block consumed by the
 auto-model-routing skill.
 
 Behaviour:
-  - Heuristic-first classifier; falls back to a Haiku API call when
-    heuristics are uncertain and ANTHROPIC_API_KEY is set.
-  - Results cached by SHA256(prompt) for 7 days under
-    ~/.claude/cache/router/.
-  - Confidence bands -> band field:
-      auto   if confidence >= AUTO_THRESHOLD  (default 0.75; opus picks
-             keep a 0.85 floor — see band_for())
-      ask    if AUTO_THRESHOLD > confidence >= ASK_THRESHOLD  (default 0.60)
-      none   otherwise (silent)
-  - Effort (low/medium/high/xhigh) is scored independently from tier; when
-    they disagree, confidence is capped to push the decision into ask band.
-  - Plan-mode detection from payload markers; emits a different message
-    instructing the planner to annotate steps with Model:/Effort: tags.
-  - Audit-logs every fired decision to ~/.claude/cache/router/audit.jsonl.
+  - Heuristic-only classifier; low-confidence heuristic misses fall through to
+    the project default (if configured) or a cheap-and-silent default.
+  - Two bands only (no `ask`): `auto` above ROUTE_FLOOR, `none` below.
+    There is no AskUserQuestion path — the injection itself is gated on
+    cost, so a mid-confidence pick is never worth an interruption.
+  - Downhill-only injection: the parent session's own model family is read
+    from the transcript, and the AUTO-ROUTE instruction is emitted ONLY when
+    the routed model is strictly cheaper (haiku < sonnet < opus < fable).
+    A same-or-higher pick is audited and stays silent.
+  - Effort (low/medium/high/xhigh) is scored independently from tier.
+  - Plan mode comes from payload.permission_mode == "plan"; it emits a
+    one-line pointer to the plan-with-models skill and nothing else.
+  - Context budget: over CC_ROUTER_CTX_WARN input tokens the injection
+    carries one extra warning line, throttled per session.
+  - Audit-logs every decision to ~/.claude/cache/router/audit.jsonl; the
+    full reason/thresholds/source/tier live there, not in the injection.
 
 Opt outs:
   - Per-prompt: append `#noshift` (or `#noroute`).
@@ -33,8 +35,6 @@ import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
 import uuid
 from datetime import datetime, timezone
 
@@ -42,15 +42,20 @@ CACHE_DIR = os.path.expanduser(
     os.environ.get("CC_ROUTER_CACHE_DIR", "~/.claude/cache/router")
 )
 AUDIT_LOG = os.path.join(CACHE_DIR, "audit.jsonl")
-CACHE_TTL_SEC = 7 * 86400
-HAIKU_TIMEOUT_SEC = 1.5
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
-MAX_PROMPT_CHARS_TO_API = 2000
 PROJECT_CONFIG_FILENAME = ".claude/router.json"
+# Overridable so tests never merge in the real ~/.claude/router.json.
+GLOBAL_CONFIG_PATH = os.path.expanduser(
+    os.environ.get("CC_ROUTER_GLOBAL_CONFIG", "~/.claude/router.json")
+)
 
-# Bumped whenever classifier output or thresholds change; cache_get treats
-# entries with a different version as a miss so old entries naturally expire.
-CLASSIFIER_VERSION = 7
+# Parent-session state read off the transcript.
+TRANSCRIPT_TAIL_BYTES = 64 * 1024
+DEFAULT_PARENT_MODEL = "opus"
+
+# Context budget: over this many input tokens the injection carries one extra
+# warning line, at most once every BUDGET_THROTTLE_PROMPTS prompts per session.
+CTX_WARN_TOKENS = int(os.environ.get("CC_ROUTER_CTX_WARN", "200000"))
+BUDGET_THROTTLE_PROMPTS = 10
 
 # Canonical model tier table. effort is the tier's default effort; agent is the
 # router-<model> subagent; auto_routable is False for tiers the classifier may
@@ -83,6 +88,11 @@ MODEL_TIERS = {
     },
 }
 
+# Cost/capability rank, cheapest first — MODEL_TIERS is declared in that order.
+# Injection is downhill-only: a routed model whose rank is >= the parent
+# session's rank buys nothing, so the hook stays silent.
+TIER_RANK = {name: i for i, name in enumerate(MODEL_TIERS)}
+
 # Audit log rotation
 AUDIT_ROTATE_BYTES = int(
     os.environ.get("CC_ROUTER_AUDIT_MAX_BYTES", str(5 * 1024 * 1024))
@@ -91,37 +101,155 @@ AUDIT_RETAIN_DAYS = int(os.environ.get("CC_ROUTER_AUDIT_RETAIN_DAYS", "30"))
 
 DEFAULT_AUTO_THRESHOLD = float(os.environ.get("CC_ROUTER_AUTO_THRESHOLD", "0.75"))
 DEFAULT_ASK_THRESHOLD = float(os.environ.get("CC_ROUTER_ASK_THRESHOLD", "0.60"))
+# Everything at or above this confidence routes; below it the hook stays
+# silent. What used to be the `ask` band now routes too — the downhill-only
+# gate makes a mid-confidence pick cheap rather than worth an interruption.
+ROUTE_FLOOR = float(os.environ.get("CC_ROUTER_ROUTE_FLOOR", "0.60"))
+
+
+def read_session_state(transcript_path: str | None) -> tuple[str, int, int]:
+    """Read the parent session's own state off its transcript.
+
+    Returns (parent_model_family, context_tokens, turn_count):
+      - parent_model_family: haiku/sonnet/opus/fable, from the model on the
+        last assistant record in the tail window.
+      - context_tokens: that record's input_tokens + cache_read + cache_creation
+        — i.e. how full the parent's context window currently is.
+      - turn_count: user records seen in the tail window (best effort).
+
+    Only the last TRANSCRIPT_TAIL_BYTES are read, so cost is flat regardless of
+    session length. Never raises: any problem yields the conservative default
+    (assume an expensive parent, unknown context), which makes the caller
+    inject less, not more.
+    """
+    try:
+        if not transcript_path:
+            return DEFAULT_PARENT_MODEL, 0, 0
+        path = os.path.expanduser(transcript_path)
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > TRANSCRIPT_TAIL_BYTES:
+                f.seek(size - TRANSCRIPT_TAIL_BYTES)
+                f.readline()  # discard the partial first line
+            tail = f.read().decode("utf-8", errors="replace")
+
+        turns = 0
+        last_assistant = None
+        for line in tail.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(rec, dict):
+                continue
+            message = rec.get("message")
+            if not isinstance(message, dict):
+                continue
+            role = rec.get("type") or message.get("role")
+            if role == "user":
+                turns += 1
+            elif role == "assistant" and message.get("model"):
+                last_assistant = message
+
+        if last_assistant is None:
+            return DEFAULT_PARENT_MODEL, 0, turns
+
+        model = str(last_assistant.get("model", "")).lower()
+        parent = next((fam for fam in TIER_RANK if fam in model), DEFAULT_PARENT_MODEL)
+
+        ctx = 0
+        usage = last_assistant.get("usage")
+        if isinstance(usage, dict):
+            for key in (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            ):
+                value = usage.get(key)
+                if isinstance(value, (int, float)):
+                    ctx += int(value)
+        return parent, ctx, turns
+    except Exception:
+        return DEFAULT_PARENT_MODEL, 0, 0
+
+
+def _read_router_json(path: str) -> dict:
+    """Load one router.json file. Missing/invalid/non-dict -> {}. Never raises."""
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _find_project_config_path(start_dir: str | None = None) -> str | None:
+    """Walk up from start_dir looking for .claude/router.json; first hit wins.
+
+    Stops before reaching the home directory — a router.json living directly
+    under `~` IS the global config (see load_project_config), not a project
+    override, so it is never returned here.
+    """
+    cur = os.path.abspath(start_dir or os.getcwd())
+    home = os.path.expanduser("~")
+    while cur != home:
+        candidate = os.path.join(cur, PROJECT_CONFIG_FILENAME)
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
 
 
 def load_project_config(start_dir: str | None = None) -> dict:
-    """Walk up from start_dir looking for .claude/router.json; first hit wins.
+    """Merge the project's .claude/router.json (walking up from start_dir)
+    with the global ~/.claude/router.json. Project rules take precedence;
+    global rules fill in. Defensive throughout — a missing or invalid file on
+    either side just contributes {}.
 
     Recognised keys (all optional):
       - disabled: bool — turn off routing for this project entirely.
       - default_model: "haiku"|"sonnet"|"opus" — pin every prompt to this
         model with band=auto unless overridden by #model= or #noshift.
-      - auto_threshold / ask_threshold: float — per-project band cutoffs.
+      - auto_threshold: float — per-project routing cutoff. ask_threshold is
+        still accepted for backward compatibility and ignored.
       - rules: list of {"match": <substring or regex>, "model": "...",
-        "reason": "...", "regex": bool}. First match wins; checked
-        against the lowercase prompt before heuristics.
+        "reason": "...", "regex": bool}. First match wins; checked against
+        the lowercase prompt before heuristics.
+
+    Merge semantics:
+      - Scalar keys (disabled, default_model, auto_threshold, ...): the
+        project's value wins when present; otherwise the global value fills
+        in.
+      - rules: concatenated project-rules-then-global-rules, so
+        `apply_project_rules`'s first-match-wins walk checks every project
+        rule before falling through to global rules.
+      - _source: the project file's path when one was found, else the global
+        file's path when it exists, else absent.
     """
-    start = os.path.abspath(start_dir or os.getcwd())
-    cur = start
-    home = os.path.expanduser("~")
-    while True:
-        candidate = os.path.join(cur, PROJECT_CONFIG_FILENAME)
-        try:
-            with open(candidate) as f:
-                cfg = json.load(f)
-            cfg["_source"] = candidate
-            return cfg
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            pass
-        parent = os.path.dirname(cur)
-        if parent == cur or cur == home:
-            break
-        cur = parent
-    return {}
+    project_path = _find_project_config_path(start_dir)
+    project_cfg = _read_router_json(project_path) if project_path else {}
+    global_path = GLOBAL_CONFIG_PATH
+    global_cfg = _read_router_json(global_path)
+
+    merged = dict(global_cfg)
+    for key, value in project_cfg.items():
+        if key != "rules":
+            merged[key] = value
+    merged["rules"] = list(project_cfg.get("rules") or []) + list(
+        global_cfg.get("rules") or []
+    )
+
+    if project_path:
+        merged["_source"] = project_path
+    elif os.path.isfile(global_path):
+        merged["_source"] = global_path
+    return merged
 
 
 def load_loop_config() -> dict:
@@ -174,8 +302,9 @@ def apply_project_rules(prompt: str, cfg: dict) -> dict | None:
 
 
 LOOKUP_VERBS = re.compile(
-    r"^(list|show|what|where|when|who|which|find|count|how many|status|read|print|"
-    r"display|tell me|summari[sz]e|name |give me|do you have)\b",
+    r"^(what is|where is|is there|does|list|show|what|where|when|who|which|find|"
+    r"count|how many|status|read|print|display|tell me|summari[sz]e|name |give me|"
+    r"do you have|check|grep|search|ls|cat|open|view)\b",
     re.I,
 )
 COMPLEX_VERBS = re.compile(
@@ -220,6 +349,22 @@ IMPERATIVE_VERB = re.compile(
 )
 
 
+# Session continuity: a short prompt opening with an acknowledgement or a
+# back-reference is a follow-up on the work already in flight, not a new task.
+# Re-routing it would strip the context the parent is holding, so it stays
+# inline no matter what the classifier thinks.
+FOLLOWUP = re.compile(
+    r"^\s*(yes|ok|okay|continue|also|now|then|that|this|it|again|go|do it|"
+    r"proceed|fix that|same)\b",
+    re.I,
+)
+FOLLOWUP_MAX_WORDS = 8
+
+
+def is_followup(prompt: str) -> bool:
+    return len(prompt.split()) <= FOLLOWUP_MAX_WORDS and bool(FOLLOWUP.match(prompt))
+
+
 def detect_fanout(prompt: str) -> tuple[bool, int]:
     """Detect a prompt that decomposes into independent subtasks.
 
@@ -258,7 +403,7 @@ def classify_heuristic(prompt: str) -> dict | None:
         conf = 0.95 if words > 25 and has_path else 0.85
         # Opus 5: start at `high`, not `xhigh`. `score_effort` still promotes
         # genuinely heavy work to xhigh; keeping the tier baseline at high
-        # avoids the effort/tier gap that needlessly caps deep picks into `ask`.
+        # avoids a needless effort/tier gap that caps the deep pick's confidence.
         return {
             "tier": "deep",
             "model": "opus",
@@ -292,8 +437,8 @@ def classify_heuristic(prompt: str) -> dict | None:
             "reasoning": "light single-surface complex verb; Sonnet 5 (escalates if deep)",
         }
     if (
-        words <= 12
-        and chars <= 80
+        words <= 20
+        and chars <= 140
         and not has_code
         and lines <= 2
         and LOOKUP_VERBS.match(lower)
@@ -325,8 +470,8 @@ def score_effort(prompt: str) -> tuple[str, float, str]:
     """Independent effort assessment from work-shape signals.
 
     Returns (effort_level, confidence, reason). Used after tier classification
-    so model and effort can disagree — that disagreement caps confidence and
-    drops the decision into the `ask` band for a human to break the tie.
+    so model and effort can disagree — a large disagreement caps confidence,
+    which is what pulls a shaky pick below ROUTE_FLOOR and silences it.
     """
     lower = prompt.lower()
     words = len(prompt.split())
@@ -381,68 +526,25 @@ def _project_default_result(project_cfg: dict, why: str) -> dict:
     }
 
 
-def classify_haiku(prompt: str) -> dict | None:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return None
-    system = (
-        "Classify the user's coding task. Return ONLY a JSON object with keys: "
-        "tier, model, effort, confidence, reasoning. "
-        "tier in {trivial,standard,complex,deep}. "
-        "model maps tier: trivial->haiku, standard->sonnet, complex->opus, deep->opus. "
-        "effort maps tier: trivial->low, standard->medium, complex->high, deep->high. "
-        "confidence is a number 0-1. reasoning is one sentence, max 20 words."
-    )
-    payload = {
-        "model": HAIKU_MODEL,
-        "max_tokens": 200,
-        "system": system,
-        "messages": [{"role": "user", "content": prompt[:MAX_PROMPT_CHARS_TO_API]}],
-    }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        method="POST",
-    )
+def _session_path(session_id: str) -> str:
+    return os.path.join(CACHE_DIR, "sessions", f"{session_id}.json")
+
+
+def _session_read(session_id: str) -> dict:
     try:
-        with urllib.request.urlopen(req, timeout=HAIKU_TIMEOUT_SEC) as resp:
-            body = json.loads(resp.read())
-        text = body["content"][0]["text"].strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", text).strip()
-        result = json.loads(text)
-        result["source"] = "haiku"
-        return result
-    except (urllib.error.URLError, TimeoutError, KeyError, ValueError, OSError):
-        return None
+        with open(_session_path(session_id)) as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        return {}
 
 
-def cache_get(prompt: str) -> dict | None:
-    h = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    path = os.path.join(CACHE_DIR, f"{h}.json")
+def _session_write(session_id: str, state: dict) -> None:
+    sessions_dir = os.path.join(CACHE_DIR, "sessions")
     try:
-        if time.time() - os.stat(path).st_mtime > CACHE_TTL_SEC:
-            return None
-        with open(path) as f:
-            data = json.load(f)
-        if data.get("classifier_version") != CLASSIFIER_VERSION:
-            return None
-        return data
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return None
-
-
-def cache_put(prompt: str, result: dict) -> None:
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        h = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        with open(os.path.join(CACHE_DIR, f"{h}.json"), "w") as f:
-            json.dump({**result, "classifier_version": CLASSIFIER_VERSION}, f)
+        os.makedirs(sessions_dir, exist_ok=True)
+        with open(_session_path(session_id), "w") as f:
+            json.dump(state, f)
     except OSError:
         pass
 
@@ -451,11 +553,11 @@ def session_bump(session_id: str) -> int:
     """Maintain CACHE_DIR/sessions/<session_id>.json {"turns": N, "ts": epoch}.
 
     Read, increment, and write the per-session turn counter on each invocation,
-    opportunistically pruning session files older than 24h. All I/O is wrapped
-    in try/except OSError and silent, mirroring cache_put. Returns the new turn
-    count (0 on any I/O failure, so the caller treats it as no bump)."""
+    opportunistically pruning session files older than 24h. Unrecognised keys
+    (e.g. budget_turn) are preserved. All I/O is silent on failure.
+    Returns the new turn count (0 on any I/O failure, so the caller treats it
+    as no bump)."""
     sessions_dir = os.path.join(CACHE_DIR, "sessions")
-    path = os.path.join(sessions_dir, f"{session_id}.json")
     try:
         os.makedirs(sessions_dir, exist_ok=True)
         cutoff = time.time() - 24 * 3600
@@ -465,48 +567,56 @@ def session_bump(session_id: str) -> int:
                     os.remove(old)
             except OSError:
                 pass
-        turns = 0
+        state = _session_read(session_id)
         try:
-            with open(path) as f:
-                turns = int(json.load(f).get("turns", 0))
-        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
-            turns = 0
-        turns += 1
-        with open(path, "w") as f:
-            json.dump({"turns": turns, "ts": int(time.time())}, f)
+            turns = int(state.get("turns", 0)) + 1
+        except (TypeError, ValueError):
+            turns = 1
+        state.update({"turns": turns, "ts": int(time.time())})
+        _session_write(session_id, state)
         return turns
     except OSError:
         return 0
 
 
+def budget_gate(session_id: str | None, turns: int) -> bool:
+    """True when the context-budget line may fire on this prompt.
+
+    Throttled to once every BUDGET_THROTTLE_PROMPTS prompts per session, using
+    the same per-session state file as the turn counter. Without a session_id
+    there is nothing to throttle against, so the warning always fires."""
+    if not session_id:
+        return True
+    state = _session_read(session_id)
+    last = state.get("budget_turn")
+    if isinstance(last, int) and turns - last < BUDGET_THROTTLE_PROMPTS:
+        return False
+    state["budget_turn"] = turns
+    _session_write(session_id, state)
+    return True
+
+
 def band_for(
-    confidence: float, auto_threshold: float, ask_threshold: float, model: str = ""
+    confidence: float,
+    auto_threshold: float = DEFAULT_AUTO_THRESHOLD,
+    ask_threshold: float | None = None,
+    model: str = "",
 ) -> str:
-    # Asymmetric risk: misrouting to opus is the expensive failure mode, so
-    # opus picks need a higher confidence floor than cheaper models. The floor
-    # comes from MODEL_TIERS[model]["auto_floor"] (opus pins 0.85);
-    # models with no floor use auto_threshold.
+    """Two bands: `auto` (routable) or `none` (silent). No `ask`.
+
+    The old asymmetric-risk machinery (AUTO_THRESHOLD plus a per-model
+    auto_floor) existed because auto-routing UP to opus was expensive. That
+    failure mode is gone: main() only injects when the routed model is
+    strictly cheaper than the parent, so a confidence that used to land in
+    `ask` now simply routes. The cutoff is therefore ROUTE_FLOOR, unless a
+    project deliberately configured an even more aggressive auto_threshold.
+
+    ask_threshold is accepted for signature compatibility (replay_kpi and
+    router_loop still pass it positionally) and ignored.
+    """
     floor = MODEL_TIERS.get(model, {}).get("auto_floor")
     effective_auto = max(auto_threshold, floor) if floor is not None else auto_threshold
-    if confidence >= effective_auto:
-        return "auto"
-    if confidence >= ask_threshold:
-        return "ask"
-    return "none"
-
-
-def detect_plan_mode(payload: dict) -> bool:
-    """Best-effort plan-mode detection from hook payload.
-
-    Prefer a structured `plan_mode` field if Claude Code provides one;
-    fall back to text markers in the JSON payload otherwise. The text
-    fallback exists because earlier Claude Code releases only surface
-    plan mode via system-reminder strings in the transcript context.
-    """
-    if payload.get("plan_mode") is True:
-        return True
-    raw = json.dumps(payload).lower()
-    return "plan mode is active" in raw or "exitplanmode" in raw
+    return "auto" if confidence >= min(effective_auto, ROUTE_FLOOR) else "none"
 
 
 def audit_rotate_if_needed() -> None:
@@ -538,6 +648,42 @@ def audit_append(record: dict) -> None:
             f.write(json.dumps(record) + "\n")
     except OSError:
         pass
+
+
+def audit_decision(
+    prompt: str,
+    session_id: str | None,
+    turns: int,
+    decision: dict,
+    outcome: str,
+    hint: str | None = None,
+) -> None:
+    """Log one classified prompt. Every decision is logged, injected or not —
+    outcome_hint says why a routable decision stayed silent."""
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
+        "session_id": session_id,
+        "turns": turns,
+        "decision": decision,
+        "outcome": outcome,
+    }
+    if hint:
+        record["outcome_hint"] = hint
+    audit_append(record)
+
+
+def emit_context(msg: str) -> None:
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": msg,
+                }
+            }
+        )
+    )
 
 
 def main() -> int:
@@ -580,6 +726,38 @@ def main() -> int:
     if project_cfg.get("disabled") is True:
         return 0
 
+    # Parent-session state: which model is holding this conversation, and how
+    # full its context already is. Both gate the injection below.
+    parent_model, ctx_tokens, _transcript_turns = read_session_state(
+        payload.get("transcript_path")
+    )
+    ctx_k = ctx_tokens // 1000
+    plan_mode = payload.get("permission_mode") == "plan"
+    session_id = payload.get("session_id")
+    turns = session_bump(str(session_id)) if session_id else 0
+
+    # Session continuity: a short acknowledgement or back-reference continues
+    # the work already in flight. The parent is holding that context; handing
+    # it to a cold subagent costs more than it saves.
+    if is_followup(prompt):
+        audit_decision(
+            prompt,
+            session_id,
+            turns,
+            {
+                "band": "none",
+                "tier": "followup",
+                "model": None,
+                "parent": parent_model,
+                "ctx": ctx_k,
+                "plan_mode": plan_mode,
+                "reason": "short follow-up on work in flight — stays inline",
+            },
+            "silent",
+            "followup_inline",
+        )
+        return 0
+
     loop_cfg = load_loop_config()
     auto_threshold = float(
         project_cfg.get(
@@ -605,54 +783,33 @@ def main() -> int:
             "reasoning": f"user override #model={forced}",
         }
     else:
-        # Order: project_rule (explicit pattern) → cache → heuristic → Haiku
-        # API → project_default (as bias on ambiguous standard, or as final
-        # fallback) → cheap-and-ask. project_default is no longer a hard
-        # short-circuit, which is what restores Haiku to its proper share
-        # of trivial reads in projects with a sonnet default.
+        # Order: project_rule (explicit pattern) → heuristic → project_default
+        # (only when the heuristic found nothing) → cheap-and-silent. A real
+        # heuristic result (any tier, any confidence) is never overridden by
+        # project_default — heuristics are microseconds, so there is nothing
+        # to gain by second-guessing a low-confidence one.
         result = apply_project_rules(prompt, project_cfg)
         if result is None:
-            cached = cache_get(prompt)
-            if cached is not None:
-                result = cached
-            else:
-                result = classify_heuristic(prompt)
-                if result is None or result.get("confidence", 0) < 0.7:
-                    haiku = classify_haiku(prompt)
-                    if haiku is not None:
-                        result = haiku
-                if (
-                    result is not None
-                    and result.get("tier") == "standard"
-                    and result.get("confidence", 1.0) < 0.80
-                    and project_cfg.get("default_model")
-                ):
-                    result = _project_default_result(
-                        project_cfg,
-                        f"bias on ambiguous standard: {result.get('reasoning', '')}",
-                    )
-                if result is None:
-                    if project_cfg.get("default_model"):
-                        result = _project_default_result(
-                            project_cfg, "no heuristic match"
-                        )
-                    else:
-                        result = {
-                            "tier": "trivial",
-                            "model": "haiku",
-                            "effort": "low",
-                            "confidence": 0.55,
-                            "source": "default",
-                            "reasoning": "no heuristic match; default cheap, ask user",
-                        }
-                cache_put(prompt, result)
+            result = classify_heuristic(prompt)
+            if result is None:
+                if project_cfg.get("default_model"):
+                    result = _project_default_result(project_cfg, "no heuristic match")
+                else:
+                    result = {
+                        "tier": "trivial",
+                        "model": "haiku",
+                        "effort": "low",
+                        "confidence": 0.55,
+                        "source": "default",
+                        "reasoning": "no heuristic match; below route floor, stay inline",
+                    }
 
     # Independent effort score: tier picks the model; effort comes from
     # work-shape signals. Adjacent disagreement (gap=1, e.g. tier wants
     # high but scorer says medium) is normal calibration — accept the
     # scored effort and keep the tier's confidence. Large disagreement
     # (gap>=2, e.g. tier wants xhigh but scorer says low) is a real
-    # ambiguity signal — cap confidence so the decision drops into ask.
+    # ambiguity signal — cap confidence so a shaky pick can fall silent.
     if result.get("tier") not in ("override", "project_rule"):
         tier_effort = result.get("effort")
         scored_effort, effort_conf, effort_reason = score_effort(prompt)
@@ -679,160 +836,104 @@ def main() -> int:
     ):
         result["model"] = "opus"
 
-    # Session continuity: once the user is several turns into a session, an
-    # ambiguous (ask-band) prompt is almost always a follow-up on the work in
-    # progress, so interrupting to ask "which model?" breaks the flow. The old
-    # behaviour nudged the auto threshold UP, which perversely pushed these
-    # prompts INTO the ask band. Instead we band on the normal threshold and,
-    # when continuity is detected, downgrade a would-be `ask` to a silent inline
-    # turn (Branch C). Only fires when the payload carries a session_id.
-    continuity = None
-    session_id = payload.get("session_id")
-    if session_id:
-        turns = session_bump(str(session_id))
-        if turns >= int(os.environ.get("CC_ROUTER_CONTINUITY_TURNS", "5")):
-            continuity = {"turns": turns}
-
-    plan_mode = detect_plan_mode(payload)
+    model = result["model"]
     fanout, fanout_hint = detect_fanout(prompt)
     band = band_for(
         float(result.get("confidence", 0)),
         auto_threshold,
         ask_threshold,
-        result.get("model", ""),
+        model,
     )
-    # Continuity: keep mid-session follow-ups inline rather than interrupting.
-    if continuity is not None and band == "ask":
-        band = "none"
-        prev = result.get("reasoning", "")
-        result["reasoning"] = (
-            prev + "; " if prev else ""
-        ) + f"continuity: staying inline mid-session (turn {continuity['turns']})"
     decision_id = "r_" + uuid.uuid4().hex[:10]
 
     decision = {
         "band": band,
-        "model": result["model"],
+        "model": model,
         "effort": result["effort"],
         "tier": result["tier"],
         "confidence": round(float(result.get("confidence", 0)), 2),
         "reason": result.get("reasoning", ""),
         "source": result.get("source", ""),
+        "parent": parent_model,
+        "ctx": ctx_k,
         "plan_mode": plan_mode,
         "fanout": fanout,
         "decision_id": decision_id,
         "thresholds": {"auto": auto_threshold, "ask": ask_threshold},
         "project_config": project_cfg.get("_source"),
     }
-    if continuity is not None:
-        decision["continuity"] = continuity
     if fanout:
         decision["fanout_hint"] = fanout_hint
 
-    # Suppress the silent band entirely; nothing to inject.
-    if band == "none" and not plan_mode:
-        audit_append(
-            {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
-                "session_id": session_id,
-                "decision": decision,
-                "outcome": "continuity_inline" if continuity is not None else "silent",
-            }
+    # Plan mode owns the turn: the planner tags each step with its own
+    # model/effort, so a whole-prompt routing decision would fight it.
+    if plan_mode:
+        audit_decision(prompt, session_id, turns, decision, "plan_mode")
+        emit_context(
+            "[auto-router] plan mode: use the plan-with-models skill; no delegation."
         )
         return 0
 
-    if plan_mode:
-        instruction = (
-            "Plan mode active. When you write the plan, every step MUST carry "
-            "`Model:` (haiku/sonnet/opus) and `Effort:` (low/medium/high/xhigh) "
-            "tags. The auto-model-router suggests the OVERALL plan tier is "
-            f"{result['model']}/{result['effort']}, but individual steps may "
-            "differ (cheap reads/edits = haiku/sonnet; deep refactor/debug = opus). "
-            "Use the `plan-with-models` skill for the canonical step template."
-        )
-    elif band == "auto" and fanout:
-        instruction = (
-            f"AUTO-ROUTE + FAN-OUT: this prompt looks decomposable (~{fanout_hint} "
-            "independent subtasks). Follow Branch E of the `auto-model-routing` "
-            "skill: split it into subtasks, classify each to the cheapest "
-            "sufficient model, and dispatch the independent ones as ONE message of "
-            "concurrent Agent() calls — but only parallelise writers whose file "
-            "sets are disjoint (read-only subtasks are always safe). Then "
-            "synthesise the results in 1-2 sentences."
-        )
-    elif band == "auto":
-        instruction = (
-            f"AUTO-ROUTE: dispatch this prompt to a `router-{result['model']}` "
-            "subagent via the Agent tool instead of executing it inline. After "
-            "the agent returns, summarise its result in 1-2 sentences. Only two "
-            "skips are legal, and BOTH must be logged per the skill's Outcome "
-            "logging section: genuinely trivial (ONE read-only tool call, no "
-            f"synthesis) -> `skipped_trivial`; or `{result['model']}` is the "
-            "model you are already running on -> `same_model_inline`. Use the "
-            "`auto-model-routing` skill for the full procedure."
-        )
-    else:  # band == "ask"
-        fan_note = (
-            " (This prompt also looks decomposable — if you delegate, consider "
-            "Branch E fan-out across independent subtasks.)"
-            if fanout
-            else ""
-        )
-        instruction = (
-            f"AMBIGUOUS classification ({band}, confidence={decision['confidence']}). "
-            f"If `{result['model']}` is the model you are already running on, "
-            "skip the question, stay inline, and log "
-            "`user_choice: auto_inline_same_model` to overrides.jsonl (see the "
-            "skill). Otherwise call AskUserQuestion with options "
-            f"[Use {result['model']} (Recommended)] [Use Opus] [Stay on current]. "
-            f"Honour the answer. Use the `auto-model-routing` skill for the procedure.{fan_note}"
-        )
+    if band == "none":
+        audit_decision(prompt, session_id, turns, decision, "silent")
+        return 0
 
-    # Plan mode is parent-authoritative: the hook cannot see it reliably (the
-    # UserPromptSubmit payload carries no plan-mode flag), so remind the parent
-    # to trust its own context over the best-effort plan_mode field below.
-    if not plan_mode:
-        instruction += (
-            "\n\nIf you are actually in PLAN MODE right now (a system reminder "
-            "says so), ignore the routing above and use the `plan-with-models` "
-            "skill instead — the plan_mode field below is best-effort and is "
-            "often stale."
+    # Downhill-only: dispatching to the model the parent already runs (or a
+    # dearer one) buys nothing and costs a cold-start brief. Audit it so the
+    # loop still sees the classification, but say nothing. The one exception is
+    # a pick the human made explicitly (`#model=fable`, a project rule): the
+    # parent cannot change its own model mid-session, so the dispatch IS the
+    # escalation mechanism and swallowing it would drop a direct instruction.
+    # Equal rank is always silent — there is nothing to escalate to.
+    routed_rank = TIER_RANK.get(model, 99)
+    parent_rank = TIER_RANK.get(parent_model, 99)
+    explicit = result.get("source") in ("override", "project_config")
+    if routed_rank == parent_rank or (routed_rank > parent_rank and not explicit):
+        audit_decision(
+            prompt, session_id, turns, decision, "silent", "same_or_higher_inline"
         )
+        return 0
 
-    fanout_tag = f" fanout={fanout_hint or 'y'}" if fanout else ""
+    budget_line = ""
+    if ctx_tokens >= CTX_WARN_TOKENS and budget_gate(session_id, turns):
+        budget_line = (
+            f"\ncontext={ctx_k}k over {CTX_WARN_TOKENS // 1000}k budget: delegate "
+            "all routable work to subagents; consider /wrap-session recap-only + "
+            "fresh session."
+        )
+    fanout_clause = (
+        " fanout: decompose into independent subtasks and dispatch them in one message."
+        if fanout
+        else ""
+    )
+
+    # Everything the parent does NOT need in-context (tier, source, reason,
+    # thresholds) stays in the audit row; the injection carries only what
+    # changes behaviour.
     msg = (
-        f"[auto-router] tier={result['tier']} model={result['model']} "
-        f"effort={result['effort']} confidence={decision['confidence']:.2f} "
-        f"source={result.get('source', '')} band={band} plan_mode={plan_mode}"
-        f"{fanout_tag}\n"
-        f"Reason: {result.get('reasoning', '')}\n\n"
-        f"{instruction}\n\n"
-        "<router-decision>\n"
-        f"{json.dumps(decision)}\n"
-        "</router-decision>"
-    )
-
-    audit_append(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
-            "session_id": session_id,
-            "decision": decision,
-            "outcome": "injected",
-        }
-    )
-
-    print(
-        json.dumps(
+        f"[auto-router] {model}/{result['effort']} "
+        f"conf={decision['confidence']:.2f} parent={parent_model} ctx={ctx_k}k\n"
+        f'AUTO-ROUTE: Agent(subagent_type="auto-model-router:router-{model}") '
+        "with a cold-start brief (files, decisions so far); verify its result; "
+        "on failure re-dispatch one tier up. Skip only for a single read-only "
+        f"call.{fanout_clause}{budget_line}\n"
+        "<router-decision>"
+        + json.dumps(
             {
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": msg,
-                }
-            }
+                "decision_id": decision_id,
+                "model": model,
+                "effort": result["effort"],
+                "band": band,
+                "parent": parent_model,
+                "ctx": ctx_k,
+            },
+            separators=(",", ":"),
         )
+        + "</router-decision>"
     )
+
+    audit_decision(prompt, session_id, turns, decision, "injected")
+    emit_context(msg)
     return 0
 
 

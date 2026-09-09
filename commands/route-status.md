@@ -76,3 +76,31 @@ Print a summary of recent auto-router activity.
 
 5. If `audit.jsonl` is missing or empty, print:
    `No auto-router activity yet. Send a prompt to see decisions.`
+
+6. **Realized cost + follow-through** — this command's own scan above is
+   decision-only (what the router *decided*). For what actually happened —
+   real $ spent per dispatch, not the all-Opus counterfactual — defer to the
+   fuller report:
+
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/tools/usage-report.py" --days 7
+   ```
+
+   Its **## Realized** section (computed from audit-row usage, not
+   `cost_kpi`'s counterfactual) reports:
+   - total $ spent, broken out by `kind/model` (`router/haiku`,
+     `native/sonnet`, `inline/opus`, ...)
+   - opus-class (opus + fable) share of that spend, as a percent
+   - **dispatch follow-through**: of decisions routed to a strictly cheaper
+     model than the parent session, the % that produced a real
+     delegated/native dispatch row (vs. silently staying inline)
+   - **escalation rate**: router dispatches whose response flagged a
+     re-dispatch-one-tier-up, as a % of dispatches
+   - median live context size (tokens) per inline, unattributed turn
+
+   Add `--compare-days N` to roll up the N days immediately before the
+   current window and print deltas next to each number, e.g.:
+
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/tools/usage-report.py" --days 7 --compare-days 7
+   ```

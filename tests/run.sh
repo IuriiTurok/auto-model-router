@@ -3,7 +3,7 @@
 #
 # Each line of fixtures.jsonl is {prompt, expect:{tier,model,effort,conf_min,band,label}}.
 # Empty expect.* fields are skipped (used when the value is intentionally
-# subject to drift, e.g. exact confidence inside an ask-band fixture).
+# subject to drift, e.g. exact confidence on a low-confidence fixture).
 #
 # Exit 0 if all fixtures pass; 1 otherwise.
 
@@ -26,6 +26,9 @@ fi
 # fixtures never pollutes the real ~/.claude/cache/router/ (audit.jsonl
 # distribution + 7-day classification cache). auto-router.py honours this var.
 export CC_ROUTER_CACHE_DIR="$(mktemp -d)"
+# Point the global-config merge at a file that doesn't exist so fixtures never
+# pick up the developer's real ~/.claude/router.json rules.
+export CC_ROUTER_GLOBAL_CONFIG="$CC_ROUTER_CACHE_DIR/no-such-global-router.json"
 trap 'rm -rf "$CC_ROUTER_CACHE_DIR"' EXIT
 
 PASS=0
@@ -62,17 +65,15 @@ while IFS= read -r fixture; do
     continue
   fi
 
-  decision=$(printf '%s' "$fixture" \
+  # Injection is downhill-only (see hooks/auto-router.py): with no
+  # transcript_path the parent is assumed to be opus, so opus/fable picks are
+  # audited but not injected. Classification is therefore asserted against the
+  # audit row the hook always writes, not against stdout. Injection behaviour
+  # itself is covered by tests/test_session_state.py.
+  printf '%s' "$fixture" \
     | jq -c '{prompt: .prompt, cwd: "/tmp"}' \
-    | python3 "$HOOK" \
-    | python3 -c "
-import json, sys
-out = json.load(sys.stdin)
-ctx = out['hookSpecificOutput']['additionalContext']
-start = ctx.index('<router-decision>') + len('<router-decision>\n')
-end = ctx.index('\n</router-decision>')
-print(ctx[start:end])
-")
+    | python3 "$HOOK" >/dev/null
+  decision=$(tail -n 1 "$CC_ROUTER_CACHE_DIR/audit.jsonl" | jq -c '.decision')
 
   got_tier=$(printf '%s' "$decision" | jq -r .tier)
   got_model=$(printf '%s' "$decision" | jq -r .model)
@@ -115,6 +116,10 @@ echo "=== tests/test_router_loop.py ==="
 python3 "$DIR/test_router_loop.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
 echo "=== tests/test_continuity.py ==="
 python3 "$DIR/test_continuity.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
+echo "=== tests/test_session_state.py ==="
+python3 "$DIR/test_session_state.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
+echo "=== tests/test_agent_audit.py ==="
+python3 "$DIR/test_agent_audit.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
 
 echo "==="
 [ "$SUITE_FAIL" -eq 0 ] && echo "ALL SUITES PASS" || echo "SUITE FAILURES: $SUITE_FAIL"

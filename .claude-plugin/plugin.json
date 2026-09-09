@@ -1,6 +1,6 @@
 {
   "name": "auto-model-router",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Per-prompt model routing for Claude Code. Heuristic + Haiku classifier picks the right model tier and effort; high-confidence prompts auto-delegate to a worker subagent. Plan-mode and multi-part prompts fan out into parallel waves with file-conflict safety. Goal-anchored: a usage report scores cost saved, user-correction rate, and time-to-results.",
   "author": {
     "name": "iuriiturok"
