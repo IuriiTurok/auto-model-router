@@ -1,0 +1,3 @@
+not json at all
+{"type":"assistant"}
+{"type":"assistant","message":{"role":"assistant"}}

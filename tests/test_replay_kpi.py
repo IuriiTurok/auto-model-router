@@ -51,24 +51,32 @@ fail += _check(
     == replay_kpi.recorded_distribution(decs),
 )
 
-# Counterfactual: a sonnet decision at conf 0.75 (auto under 0.75) falls to ask
-# when the auto threshold is raised to 0.80.
+# Two bands only: the `ask` band is gone, so raising the auto threshold no
+# longer strands a mid-confidence sonnet decision — it still routes, and the
+# downhill-only injection gate (not the threshold) decides whether it fires.
 one = [_mk(0.75, "sonnet", 0.75, 0.60)]
 dist = replay_kpi.reband_distribution(one, 0.80, 0.60, BF)
 fail += _check(
-    "counterfactual: raising auto 0.75->0.80 moves sonnet auto->ask",
-    dist.get("ask") == 1 and dist.get("auto", 0) == 0,
+    "counterfactual: raising auto 0.75->0.80 keeps sonnet routable, no ask band",
+    dist.get("auto") == 1 and dist.get("ask", 0) == 0,
 )
 
-# Model-aware opus floor (v0.7.0): opus at conf 0.85 now AUTO-routes at
-# auto=0.75 because the opus floor was lowered 0.90 -> 0.85; opus below 0.85
-# is still gated to ask.
+# The per-model opus floor is inert for the same reason: routing UP is
+# impossible now, so opus decisions band on confidence alone.
 opus = [_mk(0.85, "opus", 0.75, 0.60)]
 dist2 = replay_kpi.reband_distribution(opus, 0.75, 0.60, BF)
-fail += _check("opus floor: 0.85 opus autos at auto=0.75 (floor lowered to 0.85)", dist2.get("auto") == 1)
+fail += _check("opus at 0.85 bands auto", dist2.get("auto") == 1)
 opus_below = [_mk(0.80, "opus", 0.75, 0.60)]
 dist2b = replay_kpi.reband_distribution(opus_below, 0.75, 0.60, BF)
-fail += _check("opus floor: 0.80 opus still gated to ask (below 0.85 floor)", dist2b.get("ask") == 1)
+fail += _check(
+    "opus at 0.80 bands auto (0.85 floor no longer gates)",
+    dist2b.get("auto") == 1,
+)
+
+# Below the route floor the hook still says nothing.
+low = [_mk(0.55, "haiku", 0.75, 0.60)]
+dist2c = replay_kpi.reband_distribution(low, 0.75, 0.60, BF)
+fail += _check("0.55 confidence bands none", dist2c.get("none") == 1)
 
 # Distribution counts sum to the number of decisions.
 dist3 = replay_kpi.reband_distribution(decs, 0.75, 0.60, BF)

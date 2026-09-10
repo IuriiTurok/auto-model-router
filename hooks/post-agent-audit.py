@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: when an Agent tool call dispatches a `router-*`
-subagent, append an outcome line to the audit log so /route-status can
-distinguish *classifier recommendations* from *actually-acted-on*
-delegations.
+"""PostToolUse hook: on every Agent tool call, append an outcome line to
+the audit log recording realized usage — for both router-dispatched
+workers and native (non-router) subagents.
 
 Closes the loop with auto-router.py:
   - auto-router.py logs `outcome: "injected"` when it emits a decision.
-  - This hook logs `outcome: "delegated"` (with model + ok/failed +
-    response length + tokens + wall time + escalation signal + the
-    decision_id it joined to) every time the parent dispatches a
-    router-* worker. The outcome rows can then be JOINed against the
-    decision rows for downstream analysis.
+  - This hook logs one outcome row per Agent dispatch:
+      - router dispatches (`router-<model>` or the namespaced
+        `auto-model-router:router-<model>` form) get `outcome: "delegated"`
+        / `"delegated_failed"`, joined to the decision_id, model + ok/failed
+        + response length + tokens + wall time + escalation signal.
+      - every other subagent_type (Explore, Plan, general-purpose,
+        code-reviewer, ...) is a native dispatch and gets
+        `outcome: "native_dispatch"`.
+  - Both kinds also record agent_type, model_actual (read from the
+    subagent's own transcript), total_tokens, duration_ms, and usage{}
+    pulled from the Agent tool_response.
 
 Idempotent and silent — never blocks the tool call. If the payload
 shape is not what we expect, exits 0 without writing anything.
@@ -34,6 +39,70 @@ ESCALATION_PATTERNS = re.compile(
     r"ARTIFACTS:|NEXT STEP:)",
     re.M,
 )
+
+# Bare `router-<model>` or namespaced `auto-model-router:router-<model>`
+# (the plugin-qualified form the Agent tool sees when dispatched by name).
+ROUTER_TYPE_RE = re.compile(r"^(?:auto-model-router:)?router-(.+)$")
+
+# Tail-read cap for subagent transcript lookups (model_actual). Cheap and
+# generous — subagent transcripts are rarely bigger than this.
+TRANSCRIPT_TAIL_BYTES = 2_000_000
+
+
+def classify_subagent(subagent_type: str) -> tuple[str, str | None]:
+    """-> (kind, model).
+
+    kind is "router" for a `router-<model>` dispatch (bare or namespaced
+    `auto-model-router:router-<model>`), else "native" (Explore, Plan,
+    general-purpose, code-reviewer, and any other subagent_type). model is
+    the router model suffix for router kind, else None.
+    """
+    m = ROUTER_TYPE_RE.match(subagent_type)
+    if m:
+        return "router", (m.group(1) or "?")
+    return "native", None
+
+
+def read_model_actual(
+    transcript_path: str | None, session_id: str | None, agent_id: str | None
+) -> str | None:
+    """Best-effort: the concrete model the subagent transcript recorded on
+    its last assistant turn.
+
+    Layout: <dirname(transcript_path)>/<session_id>/subagents/agent-<agentId>.jsonl
+    Tail-reads the file to stay cheap; falls back to None on any failure.
+    """
+    if not (transcript_path and session_id and agent_id):
+        return None
+    subagent_path = os.path.join(
+        os.path.dirname(transcript_path),
+        session_id,
+        "subagents",
+        f"agent-{agent_id}.jsonl",
+    )
+    try:
+        with open(subagent_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - TRANSCRIPT_TAIL_BYTES))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    last_model = None
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if rec.get("type") == "assistant":
+            model = (rec.get("message") or {}).get("model")
+            if model:
+                last_model = model
+    return last_model
 
 
 def find_last_injected_decision_id() -> str | None:
@@ -138,10 +207,10 @@ def main() -> int:
 
     tool_input = payload.get("toolInput") or payload.get("tool_input") or {}
     subagent_type = (tool_input.get("subagent_type") or "").strip()
-    if not subagent_type.startswith("router-"):
+    if not subagent_type:
         return 0
 
-    model = subagent_type[len("router-") :] or "?"
+    kind, model = classify_subagent(subagent_type)
     tool_response = payload.get("toolResponse") or payload.get("tool_response") or {}
 
     ok = True
@@ -165,12 +234,35 @@ def main() -> int:
 
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
-        "outcome": "delegated" if ok else "delegated_failed",
+        "outcome": (
+            ("delegated" if ok else "delegated_failed")
+            if kind == "router"
+            else "native_dispatch"
+        ),
+        "kind": kind,
         "subagent_type": subagent_type,
-        "model": model,
         "response_chars": resp_len,
         "decision_id": find_last_injected_decision_id(),
     }
+    if kind == "router":
+        record["model"] = model
+
+    agent_id = None
+    if isinstance(tool_response, dict):
+        agent_id = tool_response.get("agentId")
+        record["agent_type"] = tool_response.get("agentType") or subagent_type
+        if tool_response.get("totalTokens") is not None:
+            record["total_tokens"] = tool_response.get("totalTokens")
+        if tool_response.get("totalDurationMs") is not None:
+            record["duration_ms"] = tool_response.get("totalDurationMs")
+    else:
+        record["agent_type"] = subagent_type
+
+    record["model_actual"] = read_model_actual(
+        payload.get("transcript_path") or payload.get("transcriptPath"),
+        payload.get("session_id") or payload.get("sessionId"),
+        agent_id,
+    )
 
     wall_ms = read_wall_ms(payload.get("toolUseId") or payload.get("tool_use_id"))
     if wall_ms is not None:

@@ -1,6 +1,6 @@
 ---
 name: plan-with-models
-description: Use whenever writing an implementation plan in plan mode (or any time the user asks for a step-by-step plan). Requires every step to carry `Model:`, `Effort:`, and `Files:` tags so the executor can dispatch each step to the right model via Agent(subagent_type="router-<model>") AND run independent steps in parallel waves without file conflicts.
+description: Use whenever writing an implementation plan in plan mode (or any time the user asks for a step-by-step plan). Requires every step to carry `Model:`, `Effort:`, and `Files:` tags so the executor can dispatch each step to the right model via Agent(subagent_type="auto-model-router:router-<model>") AND run independent steps in parallel waves without file conflicts.
 ---
 
 # plan-with-models
@@ -32,14 +32,14 @@ Optional fields when relevant:
 
 ## Choosing the model per step
 
-| Step looks like…                                                                                                                                  | Model                                                         |
-| ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| Read a file. List things. Run `git status`/`gh pr list`. Identify a path.                                                                         | **haiku**                                                     |
-| Edit one file. Rename a symbol. Update a single doc. Run a known build/test.                                                                      | **haiku**                                                     |
-| Refactor confined to 1–3 files. Write a spec or PR description. Iterate prototype HTML/CSS. Apply a documented migration.                         | **sonnet**                                                    |
-| Multi-file refactor (4+ files). Architectural decision. Hard debugging. New module design. CAD/firmware geometry. Cross-cutting performance work. | **opus**                                                      |
-| Verification (run tests, lint, type-check, smoke-test UI).                                                                                        | **haiku** if mechanical; **sonnet** if interpretation needed. |
-| Final review / sanity check of the whole change.                                                                                                  | **sonnet** or **opus** depending on stakes.                   |
+| Step looks like…                                                                                                                                  | Model                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Read a file. List things. Run `git status`/`gh pr list`. Identify a path.                                                                         | **haiku**                                                            |
+| Edit one file. Rename a symbol. Update a single doc. Run a known build/test.                                                                      | **haiku**                                                            |
+| Refactor confined to 1–3 files. Write a spec or PR description. Iterate prototype HTML/CSS. Apply a documented migration.                         | **sonnet**                                                           |
+| Multi-file refactor (4+ files). Architectural decision. Hard debugging. New module design. CAD/firmware geometry. Cross-cutting performance work. | **opus**                                                             |
+| Verification (run tests, lint, type-check, smoke-test UI).                                                                                        | **haiku** if mechanical; **sonnet** if interpretation needed.        |
+| Final review / sanity check of the whole change.                                                                                                  | **sonnet** or **opus** depending on stakes.                          |
 | Frontier-stakes synthesis / irreversible high-blast-radius steps.                                                                                 | **fable** — 2x opus price; use sparingly. Parent usually IS Fable 5. |
 
 ## Effort tiers
@@ -135,16 +135,19 @@ For a batch of independent steps, emit all their `Agent()` calls in a
 
 ```python
 # one batch = one message, multiple Agent() calls
-Agent(subagent_type=f"router-{step['model']}", description=f"[grp:{batch_id}] {step['title']}",
+Agent(subagent_type=f"auto-model-router:router-{step['model']}", description=f"[grp:{batch_id}] {step['title']}",
       prompt=f"{step['action']}\n\nFiles you may touch: {step['files']}\n"
              f"Do NOT edit anything outside those files.\nVerify: {step['verify']}")
 # … one Agent() call per step in the batch, all in THIS message …
 ```
 
-- Pass the step's model as `router-<model>` (cheapest sufficient model — the
-  table above). Valid values: `router-haiku`, `router-sonnet`, `router-opus`,
-  `router-fable` (fable is manual/override-only — only use when the step
-  explicitly declares `Model: fable`).
+- Pass the step's model as `auto-model-router:router-<model>` (cheapest
+  sufficient model — the table above; the namespaced form is required, bare
+  names fail with "Agent type not found"). Valid values:
+  `auto-model-router:router-haiku`, `auto-model-router:router-sonnet`,
+  `auto-model-router:router-opus`, `auto-model-router:router-fable` (fable is
+  manual/override-only — only use when the step explicitly declares
+  `Model: fable`).
 - Prefix `description` with `[grp:<batch_id>]` (any short id) so the
   outcome-capture hook can correlate the batch — this powers the
   "wall-clock saved" metric in `/route-status`.

@@ -44,7 +44,7 @@ Execute the user's task end-to-end with the full reasoning budget.
 
 **Dispatched by:** `auto-model-routing` skill (Band A complex/deep, or Band E fan-out
 for deep sub-tasks). Also directly via manual `#model=opus` tag.
-May sub-dispatch `router-haiku` or `router-sonnet` for independent pieces.
+May sub-dispatch `auto-model-router:router-haiku` or `auto-model-router:router-sonnet` for independent pieces.
 
 **Does not:** commit or push without explicit authorisation. Never skips reading
 enough of the codebase to be correct before acting.
@@ -94,7 +94,8 @@ whether future similar tasks should be kept at Opus or downshifted.
 - If a plan or skill applies, invoke it per the skill invocation order above.
 - You may dispatch further sub-agents via the `Agent` tool when the
   task has genuinely independent, sizeable parallel pieces. Use cheaper
-  models (router-haiku, router-sonnet) for sub-tasks that don't need Opus.
+  models (`auto-model-router:router-haiku`, `auto-model-router:router-sonnet`)
+  for sub-tasks that don't need Opus.
   Opus 5 delegates readily and self-verifies — do NOT spawn subagents to
   double-check your own work, and keep spawn counts low.
 - Deliver what was asked, at the scope intended: don't widen scope or add
@@ -106,11 +107,14 @@ whether future similar tasks should be kept at Opus or downshifted.
 End your turn with a structured summary the parent can relay:
 
 ```
-RESULT: <one-paragraph summary of what was done and why>
-ARTIFACTS: <files changed / created / dispatched>
+Done: <one-paragraph summary of what was done and why>
+Files changed: <paths created / edited / dispatched, or "none">
 OPEN QUESTIONS (if any): <decisions deferred to the user>
 NEXT STEP (optional): <natural follow-up>
 ```
 
-The parent will distill this to 1–2 sentences for the user, so make
-the first line of `RESULT:` the most relevant thing they need to hear.
+Lead with `Done:` (or `Done with caveats: …` when you completed but are
+flagging a concern) so the parent's verify-and-relay step keys on it; the
+`Files changed:` list lets it confirm with one cheap `git diff --stat`. The
+parent will distill this to 1–2 sentences for the user, so make the first line
+the most relevant thing they need to hear.

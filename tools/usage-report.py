@@ -32,7 +32,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hooks"))
-from pricing import PRICES, counterfactual_saving, model_family  # noqa: E402
+from pricing import PRICES, cost_usd, counterfactual_saving, model_family  # noqa: E402
 
 CACHE_DIR = os.path.expanduser(
     os.environ.get("CC_ROUTER_CACHE_DIR", "~/.claude/cache/router")
@@ -134,8 +134,15 @@ def is_human_turn(rec: dict) -> bool:
     return False
 
 
+# Bare `router-<model>` or namespaced `auto-model-router:router-<model>` (the
+# plugin-qualified form the Agent tool sees when dispatched by name) — mirrors
+# post-agent-audit.py's ROUTER_TYPE_RE.
+_ROUTER_SUBAGENT_RE = re.compile(r"^(?:auto-model-router:)?router-")
+
+
 def assistant_router_dispatch(rec: dict) -> bool:
-    """True if this assistant record dispatched a router-* subagent."""
+    """True if this assistant record dispatched a router-* subagent (bare or
+    namespaced auto-model-router:router-*)."""
     if rec.get("type") != "assistant":
         return False
     content = (rec.get("message") or {}).get("content") or []
@@ -148,7 +155,7 @@ def assistant_router_dispatch(rec: dict) -> bool:
             and b.get("name") == "Agent"
         ):
             st = (b.get("input") or {}).get("subagent_type", "")
-            if isinstance(st, str) and st.startswith("router-"):
+            if isinstance(st, str) and _ROUTER_SUBAGENT_RE.match(st):
                 return True
     return False
 
@@ -167,14 +174,21 @@ def usage_of(rec: dict):
     return fam, int(tin), int(tout)
 
 
+def _median(xs):
+    return round(statistics.median(xs), 1) if xs else None
+
+
 # ── Core analysis ───────────────────────────────────────────────────────────
-def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None) -> dict:
+def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -> dict:
     """Walk transcripts in the window; return the full KPI dict.
 
     `judge`, if given, is a callable(text)->'correction'|'approval'|'neutral'
     applied to ambiguous turns (the --llm-judge path); otherwise heuristic only.
+    `end`, if given, is the window's upper-bound datetime (default: now) — lets
+    callers (e.g. --compare-days) walk a prior window instead of "now minus days".
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    end_dt = end or datetime.now(timezone.utc)
+    cutoff = end_dt - timedelta(days=days)
     cutoff_epoch = cutoff.timestamp()
 
     tokens = defaultdict(lambda: {"in": 0, "out": 0})  # family -> tokens
@@ -214,7 +228,7 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None) -> dict:
         # Token totals: fold every in-window assistant usage (incl. subagents).
         for rec in records:
             ts = parse_ts(rec.get("timestamp"))
-            if ts is not None and ts < cutoff:
+            if ts is not None and (ts < cutoff or ts > end_dt):
                 continue
             u = usage_of(rec)
             if u:
@@ -232,7 +246,7 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None) -> dict:
         seen_first_user = False
         for rec in records:
             ts = parse_ts(rec.get("timestamp"))
-            if ts is not None and ts < cutoff:
+            if ts is not None and (ts < cutoff or ts > end_dt):
                 continue
             rtype = rec.get("type")
             if ts is not None:
@@ -276,18 +290,25 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None) -> dict:
         "cohort": {k: dict(v) for k, v in cohort.items()},
         "durations_s": durations,
         "ttfa_s": ttfa,
-        "audit": analyze_audit(days),
+        "audit": analyze_audit(days, end=end_dt),
     }
 
 
 # Inline-skip outcome vocabulary. The canonical set is the skill's mandated
 # spelling; aliases are drifted spellings seen in the wild that the analyzers
 # used to drop — fold them into `inline_other` so they're counted, not lost.
+# `auto_inline_unattributed` (reconcile-outcomes.py's deterministic backstop),
+# `same_or_higher_inline` and `followup_inline` (auto-router.py's outcome_hint
+# on a "silent" row — see below) are terminal explanations too; without them
+# here, auto_unlogged double-counts decisions that were already accounted for.
 CANONICAL_SKIPS = {
     "same_model_inline",
     "continuity_inline",
     "skipped_trivial",
     "worker_failed",
+    "auto_inline_unattributed",
+    "same_or_higher_inline",
+    "followup_inline",
 }
 SKIP_ALIASES = {
     "inline_override": "inline_other",
@@ -296,12 +317,62 @@ SKIP_ALIASES = {
     "inline": "inline_other",
 }
 
+# Cost rank, cheapest first — mirrors auto-router.py's TIER_RANK/MODEL_TIERS
+# order (haiku, sonnet, opus, fable) without importing the hook module.
+_FAMILY_RANK = {
+    fam: i
+    for i, fam in enumerate(
+        sorted(PRICES, key=lambda f: PRICES[f]["in"] + PRICES[f]["out"])
+    )
+}
 
-def analyze_audit(days: int) -> dict:
-    """Band/source/model distribution + parallelism from the router's own log.
+
+def _normalize_usage_keys(usage: dict) -> dict:
+    """The audit log carries two usage-dict shapes: post-agent-audit.py's
+    tokens_in/tokens_out/cache_read/cache_write, and reconcile-outcomes.py's
+    input/output/cache_read/cache_write (plus context_tokens). Normalize both
+    to the short keys pricing.cost_usd() understands."""
+    return {
+        "tokens_in": usage.get("tokens_in", usage.get("input", 0)) or 0,
+        "tokens_out": usage.get("tokens_out", usage.get("output", 0)) or 0,
+        "cache_read": usage.get("cache_read", 0) or 0,
+        "cache_write": usage.get("cache_write", 0) or 0,
+    }
+
+
+def _realized_add(bucket: dict, totals: dict, kind: str, model_actual, usage) -> None:
+    """Accumulate one dispatch/inline row's real usage into `bucket` (keyed
+    "<kind>/<family>") and `totals` ({"cost": .., "opus_cost": ..})."""
+    if not usage:
+        return
+    norm = _normalize_usage_keys(usage)
+    tok = sum(norm.values())
+    if not tok:
+        return
+    cost = cost_usd(model_actual, norm)
+    fam = model_family(model_actual) or "other"
+    key = f"{kind}/{fam}"
+    entry = bucket.setdefault(key, {"tokens": 0, "cost_usd": 0.0})
+    entry["tokens"] += tok
+    entry["cost_usd"] += cost
+    totals["cost"] += cost
+    if fam in ("opus", "fable"):
+        totals["opus_cost"] += cost
+
+
+def analyze_audit(days: int, end=None) -> dict:
+    """Band/source/model distribution + parallelism from the router's own log,
+    plus the "Realized" rollup — actual $ spent (by kind x model_actual family),
+    dispatch follow-through, escalation rate, and median live-context size —
+    computed from the audit rows' real usage rather than the all-Opus
+    counterfactual in cost_kpi().
 
     Reuses analyze-audit.py::find_parallel_batches via importlib (the module
-    filename is hyphenated, so it can't be a normal import)."""
+    filename is hyphenated, so it can't be a normal import).
+
+    `end`, if given, is the window's upper-bound datetime (default: now) — see
+    analyze()'s docstring.
+    """
     import importlib.util
 
     out = {"decisions": 0, "by_band": {}, "by_model": {}, "parallel": {}}
@@ -316,33 +387,87 @@ def analyze_audit(days: int) -> dict:
     except OSError:
         return out
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    end_dt = end or datetime.now(timezone.utc)
+    cutoff = end_dt - timedelta(days=days)
     by_band, by_model = Counter(), Counter()
     outcomes = []
     auto_ids = set()
     skip_outcomes = Counter()
     skip_ids_auto = 0
     dispatched = 0
+    escalations = 0
+    dispatch_ids = set()
+    cheaper_decisions = []  # (decision_id, model, parent) where model < parent rank
+    realized_bucket = {}
+    realized_totals = {"cost": 0.0, "opus_cost": 0.0}
+    ctx_tokens = []
+
     for r in rows:
         ts = parse_ts(r.get("ts"))
-        if ts is not None and ts < cutoff:
+        if ts is not None and (ts < cutoff or ts > end_dt):
             continue
         oc = r.get("outcome")
+        hint = r.get("outcome_hint")
         if oc in ("injected", "silent"):
             d = r.get("decision") or {}
             band = d.get("band", "?")
             by_band[band] += 1
             by_model[d.get("model", "?")] += 1
             out["decisions"] += 1
-            if band == "auto" and d.get("decision_id"):
-                auto_ids.add(d["decision_id"])
+            did = d.get("decision_id")
+            model, parent = d.get("model"), d.get("parent")
+            if did and model in _FAMILY_RANK and parent in _FAMILY_RANK:
+                if _FAMILY_RANK[model] < _FAMILY_RANK[parent]:
+                    cheaper_decisions.append(did)
+            if band == "auto" and did:
+                auto_ids.add(did)
+                # Some skip explanations live as outcome_hint on this same
+                # "silent" row rather than a separate joined row (see
+                # auto-router.py::audit_decision) — resolve them right here.
+                if hint in CANONICAL_SKIPS or hint in SKIP_ALIASES:
+                    skip_outcomes[SKIP_ALIASES.get(hint, hint)] += 1
+                    skip_ids_auto += 1
         elif oc in ("delegated", "delegated_failed"):
             outcomes.append(r)
             dispatched += 1
+            if r.get("escalation"):
+                escalations += 1
+            did = r.get("decision_id")
+            if did:
+                dispatch_ids.add(did)
+            _realized_add(
+                realized_bucket,
+                realized_totals,
+                r.get("kind") or "router",
+                r.get("model_actual"),
+                r.get("usage"),
+            )
+        elif oc == "native_dispatch":
+            did = r.get("decision_id")
+            if did:
+                dispatch_ids.add(did)
+            _realized_add(
+                realized_bucket,
+                realized_totals,
+                r.get("kind") or "native",
+                r.get("model_actual"),
+                r.get("usage"),
+            )
         elif oc in CANONICAL_SKIPS or oc in SKIP_ALIASES:
             skip_outcomes[SKIP_ALIASES.get(oc, oc)] += 1
             if r.get("decision_id") in auto_ids:
                 skip_ids_auto += 1
+            if oc == "auto_inline_unattributed":
+                usage = r.get("usage") or {}
+                _realized_add(
+                    realized_bucket,
+                    realized_totals,
+                    "inline",
+                    usage.get("model"),
+                    usage,
+                )
+                if usage.get("context_tokens") is not None:
+                    ctx_tokens.append(usage["context_tokens"])
 
     out["by_band"] = dict(by_band)
     out["by_model"] = dict(by_model)
@@ -352,6 +477,29 @@ def analyze_audit(days: int) -> dict:
         "auto_skip_logged": skip_ids_auto,
         "auto_unlogged": max(0, len(auto_ids) - skip_ids_auto),
         "skip_outcomes": dict(skip_outcomes),
+    }
+
+    followed = sum(1 for did in cheaper_decisions if did in dispatch_ids)
+    out["realized"] = {
+        "by_kind_model": {
+            k: {"tokens": v["tokens"], "cost_usd": round(v["cost_usd"], 4)}
+            for k, v in sorted(realized_bucket.items())
+        },
+        "total_cost_usd": round(realized_totals["cost"], 4),
+        "opus_class_cost_pct": (
+            round(100 * realized_totals["opus_cost"] / realized_totals["cost"], 1)
+            if realized_totals["cost"]
+            else None
+        ),
+        "dispatch_follow_through_pct": (
+            round(100 * followed / len(cheaper_decisions), 1)
+            if cheaper_decisions
+            else None
+        ),
+        "escalation_rate_pct": (
+            round(100 * escalations / dispatched, 1) if dispatched else None
+        ),
+        "median_context_tokens_per_turn": _median(ctx_tokens),
     }
 
     spec_path = os.path.join(os.path.dirname(__file__), "analyze-audit.py")
@@ -422,10 +570,6 @@ def quality_kpi(cohort: dict) -> dict:
     }
 
 
-def _median(xs):
-    return round(statistics.median(xs), 1) if xs else None
-
-
 def time_kpi(durations, ttfa) -> dict:
     return {
         "sessions": len(durations),
@@ -445,13 +589,25 @@ def build_report(data: dict) -> dict:
         "quality": quality_kpi(data["cohort"]),
         "time": time_kpi(data["durations_s"], data["ttfa_s"]),
         "router_activity": data["audit"],
+        "realized": data["audit"].get("realized", {}),
     }
 
 
 # ── Rendering ───────────────────────────────────────────────────────────────
-def render_markdown(rep: dict, today: str) -> str:
+def _fmt_delta(cur, prior, pct=False) -> str:
+    if cur is None or prior is None:
+        return "n/a"
+    d = cur - prior
+    sign = "+" if d >= 0 else ""
+    return f"{sign}{d:.1f}{'pp' if pct else ''}"
+
+
+def render_markdown(
+    rep: dict, today: str, compare: dict | None = None, compare_days: int | None = None
+) -> str:
     c, q, t, a = rep["cost"], rep["quality"], rep["time"], rep["router_activity"]
     rc = a.get("reconciliation", {})
+    r = rep["realized"]
     lines = [
         "---",
         f"date: {today}",
@@ -498,6 +654,28 @@ def render_markdown(rep: dict, today: str) -> str:
         f"  - skip outcomes, drifted spellings folded into inline_other: "
         f"{rc.get('skip_outcomes', {})}",
         "",
+        "## Realized — actual $ from audit-row usage (not the all-Opus counterfactual)",
+        "",
+        f"- Total realized spend: ${r.get('total_cost_usd', 0)} "
+        "(router/native dispatch rows + inline-unattributed usage, real tokens x real price)",
+        f"- Opus-class (opus + fable) cost share: {r.get('opus_class_cost_pct')}%",
+        f"- Dispatch follow-through: {r.get('dispatch_follow_through_pct')}% "
+        "(of decisions routed to a strictly cheaper model than the parent, the "
+        "% that produced a real delegated/native dispatch row)",
+        f"- Escalation rate: {r.get('escalation_rate_pct')}% "
+        "(router dispatches whose response flagged a re-dispatch-one-tier-up)",
+        f"- Median live context per turn (inline, unattributed usage): "
+        f"{r.get('median_context_tokens_per_turn')} tokens",
+        "- $ / tokens by kind x model family:",
+    ]
+    by_kind_model = r.get("by_kind_model", {})
+    if by_kind_model:
+        for key, v in sorted(by_kind_model.items()):
+            lines.append(f"    - {key:<14} {v['tokens']:>7,} tok  ${v['cost_usd']}")
+    else:
+        lines.append("    - (no dispatch/inline usage rows in window)")
+    lines += [
+        "",
         "## GOAL 2 — Quality (user-correction rate)",
         "",
         f"- Router-delegated turns: {q['router']['turns']} · "
@@ -520,6 +698,37 @@ def render_markdown(rep: dict, today: str) -> str:
         "Router-vs-inline timing is correlation, not causation._",
         "",
     ]
+
+    if compare is not None:
+        pc, pt, pr = compare["cost"], compare["time"], compare["realized"]
+        pa = compare["router_activity"]
+        lines += [
+            f"## Comparison — prior {compare_days}d "
+            f"(window ending {rep['window_days']}d ago)",
+            "",
+            f"- Router decisions: {a['decisions']} vs {pa['decisions']} "
+            f"({_fmt_delta(a['decisions'], pa['decisions'])})",
+            f"- Net vs all-Opus: ${c['est_saved_vs_opus_usd']} vs "
+            f"${pc['est_saved_vs_opus_usd']} "
+            f"({_fmt_delta(c['est_saved_vs_opus_usd'], pc['est_saved_vs_opus_usd'])})",
+            f"- Realized total spend: ${r.get('total_cost_usd', 0)} vs "
+            f"${pr.get('total_cost_usd', 0)} "
+            f"({_fmt_delta(r.get('total_cost_usd'), pr.get('total_cost_usd'))})",
+            f"- Opus-class cost share: {r.get('opus_class_cost_pct')}% vs "
+            f"{pr.get('opus_class_cost_pct')}% "
+            f"({_fmt_delta(r.get('opus_class_cost_pct'), pr.get('opus_class_cost_pct'), pct=True)})",
+            f"- Dispatch follow-through: {r.get('dispatch_follow_through_pct')}% vs "
+            f"{pr.get('dispatch_follow_through_pct')}% "
+            f"({_fmt_delta(r.get('dispatch_follow_through_pct'), pr.get('dispatch_follow_through_pct'), pct=True)})",
+            f"- Escalation rate: {r.get('escalation_rate_pct')}% vs "
+            f"{pr.get('escalation_rate_pct')}% "
+            f"({_fmt_delta(r.get('escalation_rate_pct'), pr.get('escalation_rate_pct'), pct=True)})",
+            f"- Median session duration: {t['median_duration_min']} min vs "
+            f"{pt['median_duration_min']} min "
+            f"({_fmt_delta(t['median_duration_min'], pt['median_duration_min'])})",
+            "",
+        ]
+
     return "\n".join(lines)
 
 
@@ -576,19 +785,37 @@ def main() -> int:
     p.add_argument(
         "--today", help="YYYY-MM-DD stamp for the report file (default: derived)"
     )
+    p.add_argument(
+        "--compare-days",
+        type=int,
+        default=None,
+        help="also roll up the N days immediately before the current window "
+        "and print deltas next to the current numbers",
+    )
     args = p.parse_args()
 
     days = 1 if args.since in ("yesterday", "today") else args.days
     judge = make_haiku_judge() if args.llm_judge else None
-    data = analyze(days, judge=judge)
+    now = datetime.now(timezone.utc)
+    data = analyze(days, judge=judge, end=now)
     rep = build_report(data)
 
+    compare = None
+    if args.compare_days:
+        prior_end = now - timedelta(days=days)
+        compare = build_report(
+            analyze(args.compare_days, judge=judge, end=prior_end)
+        )
+
     if args.json:
-        print(json.dumps(rep, indent=2))
+        out = dict(rep)
+        if compare is not None:
+            out["compare"] = compare
+        print(json.dumps(out, indent=2))
         return 0
 
-    today = args.today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    md = render_markdown(rep, today)
+    today = args.today or now.strftime("%Y-%m-%d")
+    md = render_markdown(rep, today, compare=compare, compare_days=args.compare_days)
     if args.write:
         os.makedirs(REPORTS_DIR, exist_ok=True)
         out_path = os.path.join(REPORTS_DIR, f"{today}.md")
