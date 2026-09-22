@@ -105,26 +105,37 @@ def read_model_actual(
     return last_model
 
 
-def find_last_injected_decision_id() -> str | None:
+def find_last_injected_decision_id(session_id: str | None = None) -> str | None:
     """Best-effort JOIN key: the decision_id of the most recent injected
-    decision in audit.jsonl. Reads only the tail of the file to stay cheap.
+    decision for this session in audit.jsonl. Reads only the tail of the
+    file to stay cheap.
 
-    Under sequential usage this is exact; under parallel Agent dispatch
-    (rare) the join may be off by one — acceptable for a feedback signal.
+    audit.jsonl is shared across every concurrent session (night-shift,
+    daily-status, and any interactive sessions all append here), so the join
+    is scoped to ``session_id`` when the payload carries one: a dispatch is
+    matched only to an injected decision from its OWN session, never to a
+    different session's most-recent decision. If no same-session decision is
+    in the tail window, it returns None (honest "unknown" beats a wrong
+    cross-session join for a measurement signal). When no session_id is given
+    (older payloads that predate session_id logging), it falls back to the
+    most recent injected decision of any session — the prior behaviour.
     """
     try:
         with open(AUDIT_LOG, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            f.seek(max(0, size - 65536))
+            f.seek(max(0, size - 262144))
             tail = f.read().decode("utf-8", errors="replace")
         for line in reversed(tail.splitlines()):
             try:
                 rec = json.loads(line)
             except (json.JSONDecodeError, ValueError):
                 continue
-            if rec.get("outcome") == "injected":
-                return (rec.get("decision") or {}).get("decision_id")
+            if rec.get("outcome") != "injected":
+                continue
+            if session_id is not None and rec.get("session_id") != session_id:
+                continue
+            return (rec.get("decision") or {}).get("decision_id")
     except (OSError, ValueError):
         pass
     return None
@@ -232,6 +243,7 @@ def main() -> int:
         if m:
             escalation = m.group(1)
 
+    session_id = payload.get("session_id") or payload.get("sessionId")
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "outcome": (
@@ -242,7 +254,7 @@ def main() -> int:
         "kind": kind,
         "subagent_type": subagent_type,
         "response_chars": resp_len,
-        "decision_id": find_last_injected_decision_id(),
+        "decision_id": find_last_injected_decision_id(session_id),
     }
     if kind == "router":
         record["model"] = model
@@ -260,7 +272,7 @@ def main() -> int:
 
     record["model_actual"] = read_model_actual(
         payload.get("transcript_path") or payload.get("transcriptPath"),
-        payload.get("session_id") or payload.get("sessionId"),
+        session_id,
         agent_id,
     )
 
