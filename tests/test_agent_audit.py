@@ -65,9 +65,7 @@ def write_subagent_transcript(
     os.makedirs(subagent_dir, exist_ok=True)
     subagent_path = os.path.join(subagent_dir, f"agent-{agent_id}.jsonl")
     with open(subagent_path, "w") as f:
-        f.write(
-            json.dumps({"type": "assistant", "message": {"model": model}}) + "\n"
-        )
+        f.write(json.dumps({"type": "assistant", "message": {"model": model}}) + "\n")
         # a later record with no model should not override the last-seen one
         f.write(json.dumps({"type": "user", "message": {"content": "ok"}}) + "\n")
 
@@ -158,7 +156,10 @@ with tempfile.TemporaryDirectory() as cache_dir:
         (row.get("usage") or {}).get("tokens_in") == 100,
     )
     check("namespaced router: wall_ms present", isinstance(row.get("wall_ms"), int))
-    check("namespaced router: agent_type == router-sonnet", row.get("agent_type") == "router-sonnet")
+    check(
+        "namespaced router: agent_type == router-sonnet",
+        row.get("agent_type") == "router-sonnet",
+    )
 
 # ---------------------------------------------------------------------------
 # Test 2: bare router dispatch (router-opus)
@@ -288,9 +289,7 @@ with tempfile.TemporaryDirectory() as cache_dir:
             json.dumps(
                 {
                     "type": "user",
-                    "message": {
-                        "content": [{"type": "tool_result", "content": "ok"}]
-                    },
+                    "message": {"content": [{"type": "tool_result", "content": "ok"}]},
                 }
             )
             + "\n"
@@ -340,7 +339,10 @@ with tempfile.TemporaryDirectory() as cache_dir:
     usage = (added[0] or {}).get("usage") if added else None
     check("reconcile: usage block present", usage is not None)
     if usage:
-        check("reconcile: usage.input == 250 (200+50, excludes pre-human turn)", usage.get("input") == 250)
+        check(
+            "reconcile: usage.input == 250 (200+50, excludes pre-human turn)",
+            usage.get("input") == 250,
+        )
         check("reconcile: usage.output == 45", usage.get("output") == 45)
         check("reconcile: usage.cache_read == 25", usage.get("cache_read") == 25)
         check("reconcile: usage.cache_write == 12", usage.get("cache_write") == 12)
@@ -348,7 +350,10 @@ with tempfile.TemporaryDirectory() as cache_dir:
             "reconcile: usage.context_tokens == last turn's input+cache_read+cache_write (50+5+2=57)",
             usage.get("context_tokens") == 57,
         )
-        check("reconcile: usage.model == claude-sonnet-5", usage.get("model") == "claude-sonnet-5")
+        check(
+            "reconcile: usage.model == claude-sonnet-5",
+            usage.get("model") == "claude-sonnet-5",
+        )
 
 # ---------------------------------------------------------------------------
 # Test 6: pricing.py cache_read/cache_write rates + cost_usd helper
@@ -401,6 +406,107 @@ check(
     "pricing: cost_usd returns 0.0 for empty usage",
     pricing.cost_usd("sonnet", {}) == 0.0,
 )
+
+# ---------------------------------------------------------------------------
+# Test 7: session-scoped decision_id join. audit.jsonl is shared across
+# concurrent sessions; a router dispatch must join to ITS OWN session's
+# injected decision, not to a different session's globally-most-recent one.
+# ---------------------------------------------------------------------------
+with tempfile.TemporaryDirectory() as cache_dir:
+    os.makedirs(cache_dir, exist_ok=True)
+    audit_path = os.path.join(cache_dir, "audit.jsonl")
+    with open(audit_path, "w") as f:
+        # our session's injected decision (written first -> older)
+        f.write(
+            json.dumps(
+                {
+                    "ts": "2026-09-22T00:00:00+00:00",
+                    "outcome": "injected",
+                    "session_id": "sess-A",
+                    "decision": {"decision_id": "dec-A", "band": "auto", "model": "sonnet"},
+                }
+            )
+            + "\n"
+        )
+        # a DIFFERENT concurrent session's injected decision, written last so
+        # it is the globally-most-recent injected row (the mis-join trap the
+        # pre-fix code fell into).
+        f.write(
+            json.dumps(
+                {
+                    "ts": "2026-09-22T00:00:05+00:00",
+                    "outcome": "injected",
+                    "session_id": "sess-B",
+                    "decision": {"decision_id": "dec-B", "band": "auto", "model": "opus"},
+                }
+            )
+            + "\n"
+        )
+
+    transcript_path = os.path.join(cache_dir, "session.jsonl")
+    write_subagent_transcript(transcript_path, "sess-A", "a7", "claude-sonnet-5")
+    tool_input = {
+        "subagent_type": "auto-model-router:router-sonnet",
+        "description": "x",
+    }
+    run_hook(
+        POST_AUDIT,
+        {
+            "tool_name": "Agent",
+            "tool_input": tool_input,
+            "tool_response": {"agentId": "a7", "agentType": "router-sonnet"},
+            "tool_use_id": "tu-a7",
+            "session_id": "sess-A",
+            "transcript_path": transcript_path,
+        },
+        cache_dir,
+    )
+    rows = read_audit(cache_dir)
+    delegated = [r for r in rows if r.get("outcome") == "delegated"]
+    check("session-scoped join: one delegated row", len(delegated) == 1)
+    if delegated:
+        check(
+            "session-scoped join: joins own session (dec-A), not most-recent dec-B",
+            delegated[0].get("decision_id") == "dec-A",
+        )
+
+# ---------------------------------------------------------------------------
+# Test 8: legacy payload with no session_id falls back to the most-recent
+# injected decision of any session (pre-session-scoping behaviour preserved).
+# ---------------------------------------------------------------------------
+with tempfile.TemporaryDirectory() as cache_dir:
+    os.makedirs(cache_dir, exist_ok=True)
+    audit_path = os.path.join(cache_dir, "audit.jsonl")
+    with open(audit_path, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "ts": "2026-09-22T00:00:00+00:00",
+                    "outcome": "injected",
+                    "session_id": "sess-X",
+                    "decision": {"decision_id": "dec-X"},
+                }
+            )
+            + "\n"
+        )
+    run_hook(
+        POST_AUDIT,
+        {
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "router-opus", "description": "y"},
+            "tool_response": {"agentId": "z1", "agentType": "router-opus"},
+            "tool_use_id": "tu-z1",
+        },
+        cache_dir,
+    )
+    rows = read_audit(cache_dir)
+    delegated = [r for r in rows if r.get("outcome") == "delegated"]
+    check("legacy no-session fallback: one delegated row", len(delegated) == 1)
+    if delegated:
+        check(
+            "legacy no-session fallback: joins most-recent injected (dec-X)",
+            delegated[0].get("decision_id") == "dec-X",
+        )
 
 print(f"--- agent_audit: {'OK' if FAIL == 0 else f'{FAIL} FAILED'}")
 sys.exit(1 if FAIL else 0)
