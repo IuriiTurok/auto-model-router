@@ -112,6 +112,8 @@ echo "=== tests/test_usage_report.py ==="
 python3 "$DIR/test_usage_report.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
 echo "=== tests/test_replay_kpi.py ==="
 python3 "$DIR/test_replay_kpi.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
+echo "=== tests/test_replay_session_pivot.py ==="
+python3 "$DIR/test_replay_session_pivot.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
 echo "=== tests/test_router_loop.py ==="
 python3 "$DIR/test_router_loop.py" || SUITE_FAIL=$((SUITE_FAIL + 1))
 echo "=== tests/test_continuity.py ==="
