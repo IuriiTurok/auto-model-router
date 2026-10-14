@@ -4,28 +4,33 @@ machine-readable <router-decision> block consumed by the
 auto-model-routing skill.
 
 Behaviour:
-  - Heuristic-only classifier; low-confidence heuristic misses fall through to
-    the project default (if configured) or a cheap-and-silent default.
-  - Two bands only (no `ask`): `auto` above ROUTE_FLOOR, `none` below.
-    There is no AskUserQuestion path — the injection itself is gated on
-    cost, so a mid-confidence pick is never worth an interruption.
+  - Harness events (task notifications, scheduled-task runs, system
+    notifications) are not human prompts: the hook exits without classifying,
+    injecting, or writing an audit row.
+  - Heuristic-only classifier; a heuristic miss falls through to the
+    project's default_model (audited, never injected) or a cheap-and-silent
+    default. Short lookups stay inline: a cold worker cannot answer a
+    continuity question and the brief costs more than the lookup.
+  - Two bands only: `auto` at or above ROUTE_FLOOR, `none` below.
   - Downhill-only injection: the parent session's own model family is read
     from the transcript, and the AUTO-ROUTE instruction is emitted ONLY when
     the routed model is strictly cheaper (haiku < sonnet < opus < fable).
-    A same-or-higher pick is audited and stays silent.
+    A same-or-higher pick is audited and stays silent. Only an inline
+    `#model=` tag may route up (the parent cannot change its own model);
+    router.json rules get no exemption.
   - Effort (low/medium/high/xhigh) is scored independently from tier.
   - Plan mode comes from payload.permission_mode == "plan"; it emits a
     one-line pointer to the plan-with-models skill and nothing else.
   - Context budget: over CC_ROUTER_CTX_WARN input tokens the injection
     carries one extra warning line, throttled per session.
   - Audit-logs every decision to ~/.claude/cache/router/audit.jsonl; the
-    full reason/thresholds/source/tier live there, not in the injection.
+    full reason/source/tier live there, not in the injection.
 
 Opt outs:
   - Per-prompt: append `#noshift` (or `#noroute`).
   - Global: env CC_ROUTER_DISABLE=1.
   - Override decision: prompt contains `#model=opus` / `#model=sonnet`
-    / `#model=haiku`.
+    / `#model=haiku` / `#model=fable`.
 """
 
 import glob
@@ -51,40 +56,41 @@ GLOBAL_CONFIG_PATH = os.path.expanduser(
 # Parent-session state read off the transcript.
 TRANSCRIPT_TAIL_BYTES = 64 * 1024
 DEFAULT_PARENT_MODEL = "opus"
+# Claude Code writes zero-usage placeholder records (API errors, "No response
+# requested.") under this model. They say nothing about the session's model.
+SYNTHETIC_MODEL = "<synthetic>"
 
-# Context budget: over this many input tokens the injection carries one extra
-# warning line, at most once every BUDGET_THROTTLE_PROMPTS prompts per session.
-CTX_WARN_TOKENS = int(os.environ.get("CC_ROUTER_CTX_WARN", "200000"))
+# Context budget: over this many input tokens (the auto-compact window) the
+# injection carries one extra warning line, at most once every
+# BUDGET_THROTTLE_PROMPTS prompts per session.
+CTX_WARN_TOKENS = int(os.environ.get("CC_ROUTER_CTX_WARN", "600000"))
 BUDGET_THROTTLE_PROMPTS = 10
 
-# Canonical model tier table. effort is the tier's default effort; agent is the
+# Canonical model tier table. effort is the effort the router records for a
+# forced pick of that tier (the 5.5 models default to medium, Fable 5.1 to high;
+# the worker agents pin their own effort in their frontmatter); agent is the
 # router-<model> subagent; auto_routable is False for tiers the classifier may
-# never auto-pick (manual dispatch only); auto_floor overrides AUTO_THRESHOLD
-# for that model in band_for() (None = use AUTO_THRESHOLD).
+# never auto-pick (manual dispatch only).
 MODEL_TIERS = {
     "haiku": {
-        "effort": "low",  # cosmetic: Haiku 4.5 does not support the effort param
+        "effort": "low",
         "agent": "router-haiku",
         "auto_routable": True,
-        "auto_floor": None,
     },
     "sonnet": {
         "effort": "medium",
         "agent": "router-sonnet",
         "auto_routable": True,
-        "auto_floor": None,
     },
     "opus": {
         "effort": "high",
         "agent": "router-opus",
         "auto_routable": True,
-        "auto_floor": 0.85,
     },
     "fable": {
         "effort": "xhigh",
         "agent": "router-fable",
         "auto_routable": False,
-        "auto_floor": None,
     },
 }
 
@@ -99,11 +105,9 @@ AUDIT_ROTATE_BYTES = int(
 )
 AUDIT_RETAIN_DAYS = int(os.environ.get("CC_ROUTER_AUDIT_RETAIN_DAYS", "30"))
 
-DEFAULT_AUTO_THRESHOLD = float(os.environ.get("CC_ROUTER_AUTO_THRESHOLD", "0.75"))
-DEFAULT_ASK_THRESHOLD = float(os.environ.get("CC_ROUTER_ASK_THRESHOLD", "0.60"))
 # Everything at or above this confidence routes; below it the hook stays
-# silent. What used to be the `ask` band now routes too — the downhill-only
-# gate makes a mid-confidence pick cheap rather than worth an interruption.
+# silent. The downhill-only gate makes a mid-confidence pick cheap, so there is
+# no band in between.
 ROUTE_FLOOR = float(os.environ.get("CC_ROUTER_ROUTE_FLOOR", "0.60"))
 
 
@@ -151,7 +155,11 @@ def read_session_state(transcript_path: str | None) -> tuple[str, int, int]:
             role = rec.get("type") or message.get("role")
             if role == "user":
                 turns += 1
-            elif role == "assistant" and message.get("model"):
+            elif (
+                role == "assistant"
+                and message.get("model")
+                and message.get("model") != SYNTHETIC_MODEL
+            ):
                 last_assistant = message
 
         if last_assistant is None:
@@ -214,18 +222,17 @@ def load_project_config(start_dir: str | None = None) -> dict:
 
     Recognised keys (all optional):
       - disabled: bool — turn off routing for this project entirely.
-      - default_model: "haiku"|"sonnet"|"opus" — pin every prompt to this
-        model with band=auto unless overridden by #model= or #noshift.
-      - auto_threshold: float — per-project routing cutoff. ask_threshold is
-        still accepted for backward compatibility and ignored.
+      - default_model: "haiku"|"sonnet"|"opus" — the pick for prompts no
+        heuristic matched. It is audited but never injected (it carries no
+        per-prompt signal).
       - rules: list of {"match": <substring or regex>, "model": "...",
         "reason": "...", "regex": bool}. First match wins; checked against
-        the lowercase prompt before heuristics.
+        the lowercase prompt before heuristics. A rule's pick must still be
+        strictly cheaper than the parent session to be injected.
 
     Merge semantics:
-      - Scalar keys (disabled, default_model, auto_threshold, ...): the
-        project's value wins when present; otherwise the global value fills
-        in.
+      - Scalar keys (disabled, default_model, ...): the project's value wins
+        when present; otherwise the global value fills in.
       - rules: concatenated project-rules-then-global-rules, so
         `apply_project_rules`'s first-match-wins walk checks every project
         rule before falling through to global rules.
@@ -250,22 +257,6 @@ def load_project_config(start_dir: str | None = None) -> dict:
     elif os.path.isfile(global_path):
         merged["_source"] = global_path
     return merged
-
-
-def load_loop_config() -> dict:
-    """Global thresholds tuned by the /router-loop self-improvement loop.
-
-    Lowest precedence: a per-project .claude/router.json still overrides these,
-    and these override the hardcoded DEFAULT_*_THRESHOLD. Lives under CACHE_DIR
-    so it is naturally absent (and inert) during the test suite, which points
-    CC_ROUTER_CACHE_DIR at a throwaway dir.
-    """
-    p = os.path.join(CACHE_DIR, "loop-config", "router.json")
-    try:
-        with open(p) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
 
 
 def apply_project_rules(prompt: str, cfg: dict) -> dict | None:
@@ -349,6 +340,19 @@ IMPERATIVE_VERB = re.compile(
 )
 
 
+# Harness events reach UserPromptSubmit like typed prompts but are not: a
+# background-task completion, a scheduled-task run, a system notification. They
+# may arrive wrapped in <system-reminder>. Classifying them is pure noise.
+HARNESS_EVENT = re.compile(
+    r"\s*(?:<system-reminder>\s*)?"
+    r"(?:<task-notification|<scheduled-task|\[SYSTEM NOTIFICATION)"
+)
+
+
+def is_harness_event(prompt: str) -> bool:
+    return bool(HARNESS_EVENT.match(prompt))
+
+
 # Session continuity: a short prompt opening with an acknowledgement or a
 # back-reference is a follow-up on the work already in flight, not a new task.
 # Re-routing it would strip the context the parent is holding, so it stays
@@ -401,7 +405,7 @@ def classify_heuristic(prompt: str) -> dict | None:
     if DEEP_VERBS.search(lower):
         # Long, file-anchored design/audit requests are highest-signal opus work.
         conf = 0.95 if words > 25 and has_path else 0.85
-        # Opus 5: start at `high`, not `xhigh`. `score_effort` still promotes
+        # Opus 5.5: start at `high`, not `xhigh`. `score_effort` still promotes
         # genuinely heavy work to xhigh; keeping the tier baseline at high
         # avoids a needless effort/tier gap that caps the deep pick's confidence.
         return {
@@ -426,15 +430,15 @@ def classify_heuristic(prompt: str) -> dict | None:
                 "reasoning": "complex task verb (refactor/implement/migrate/etc.)",
             }
         # Balanced rebalance: light, single-surface complex work goes to
-        # Sonnet 5 (now the Claude Code default, ~2x cheaper). The router-sonnet
-        # worker escalates via `Stopped:` if it discovers real depth.
+        # Sonnet 5.5 (half the price of Opus 5.5). The router-sonnet worker
+        # escalates via `Stopped:` if it discovers real depth.
         return {
             "tier": "complex",
             "model": "sonnet",
             "effort": "medium",
             "confidence": 0.82,
             "source": "heuristic",
-            "reasoning": "light single-surface complex verb; Sonnet 5 (escalates if deep)",
+            "reasoning": "light single-surface complex verb; Sonnet 5.5 (escalates if deep)",
         }
     if (
         words <= 20
@@ -443,16 +447,12 @@ def classify_heuristic(prompt: str) -> dict | None:
         and lines <= 2
         and LOOKUP_VERBS.match(lower)
     ):
-        # A trailing "?" on a short lookup is the clearest possible Haiku signal.
-        conf = 0.95 if prompt.rstrip().endswith("?") else 0.90
-        return {
-            "tier": "trivial",
-            "model": "haiku",
-            "effort": "low",
-            "confidence": conf,
-            "source": "heuristic",
-            "reasoning": "short lookup phrasing",
-        }
+        # Short lookups are answered inline: the audit showed zero haiku
+        # dispatches ever followed, and most hits were "status?"-style
+        # continuity questions a cold worker cannot answer. No pick — the
+        # caller falls through to its silent default. A user rule in
+        # router.json can still route a lookup pattern explicitly.
+        return None
     if 5 <= words <= 60 and not has_code and lines <= 5:
         # Catch-all for normal-length prompts without complex/deep verbs.
         return {
@@ -596,27 +596,14 @@ def budget_gate(session_id: str | None, turns: int) -> bool:
     return True
 
 
-def band_for(
-    confidence: float,
-    auto_threshold: float = DEFAULT_AUTO_THRESHOLD,
-    ask_threshold: float | None = None,
-    model: str = "",
-) -> str:
-    """Two bands: `auto` (routable) or `none` (silent). No `ask`.
+def band_for(confidence: float) -> str:
+    """Two bands: `auto` (routable) or `none` (silent).
 
-    The old asymmetric-risk machinery (AUTO_THRESHOLD plus a per-model
-    auto_floor) existed because auto-routing UP to opus was expensive. That
-    failure mode is gone: main() only injects when the routed model is
-    strictly cheaper than the parent, so a confidence that used to land in
-    `ask` now simply routes. The cutoff is therefore ROUTE_FLOOR, unless a
-    project deliberately configured an even more aggressive auto_threshold.
-
-    ask_threshold is accepted for signature compatibility (replay_kpi and
-    router_loop still pass it positionally) and ignored.
+    main() only injects when the routed model is strictly cheaper than the
+    parent, so routing a mid-confidence pick is cheap and the one cutoff is
+    ROUTE_FLOOR.
     """
-    floor = MODEL_TIERS.get(model, {}).get("auto_floor")
-    effective_auto = max(auto_threshold, floor) if floor is not None else auto_threshold
-    return "auto" if confidence >= min(effective_auto, ROUTE_FLOOR) else "none"
+    return "auto" if confidence >= ROUTE_FLOOR else "none"
 
 
 def audit_rotate_if_needed() -> None:
@@ -696,6 +683,8 @@ def main() -> int:
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
         return 0
+    if is_harness_event(prompt):
+        return 0
     lower = prompt.lower()
     if "#noshift" in lower or "#noroute" in lower:
         return 0
@@ -738,8 +727,10 @@ def main() -> int:
 
     # Session continuity: a short acknowledgement or back-reference continues
     # the work already in flight. The parent is holding that context; handing
-    # it to a cold subagent costs more than it saves.
-    if is_followup(prompt):
+    # it to a cold subagent costs more than it saves. An inline `#model=` tag is
+    # an explicit instruction (and the only way to route up), so it is never
+    # swallowed as a follow-up.
+    if is_followup(prompt) and not OVERRIDE_PATTERN.search(prompt):
         audit_decision(
             prompt,
             session_id,
@@ -757,18 +748,6 @@ def main() -> int:
             "followup_inline",
         )
         return 0
-
-    loop_cfg = load_loop_config()
-    auto_threshold = float(
-        project_cfg.get(
-            "auto_threshold", loop_cfg.get("auto_threshold", DEFAULT_AUTO_THRESHOLD)
-        )
-    )
-    ask_threshold = float(
-        project_cfg.get(
-            "ask_threshold", loop_cfg.get("ask_threshold", DEFAULT_ASK_THRESHOLD)
-        )
-    )
 
     # Explicit override -> emit a high-confidence auto decision and skip classification
     override = OVERRIDE_PATTERN.search(prompt)
@@ -796,7 +775,7 @@ def main() -> int:
                     result = _project_default_result(project_cfg, "no heuristic match")
                 else:
                     result = {
-                        "tier": "trivial",
+                        "tier": "default",
                         "model": "haiku",
                         "effort": "low",
                         "confidence": 0.55,
@@ -827,9 +806,9 @@ def main() -> int:
                 f"{tier_effort}->{scored_effort}: {effort_reason}"
             )
 
-    # Parent session already runs Fable 5; fable is 2x opus price — manual
-    # dispatch only. Clamp a classifier-picked fable down to opus unless the
-    # user explicitly asked for it (#model=fable) or a project rule pinned it.
+    # Fable 5.1 is 2.5x the price of Opus 5.5 — manual dispatch only. Clamp a
+    # classifier-picked fable down to opus unless the user explicitly asked for
+    # it (#model=fable) or a project rule pinned it.
     if result.get("model") == "fable" and result.get("source") not in (
         "override",
         "project_config",
@@ -838,12 +817,12 @@ def main() -> int:
 
     model = result["model"]
     fanout, fanout_hint = detect_fanout(prompt)
-    band = band_for(
-        float(result.get("confidence", 0)),
-        auto_threshold,
-        ask_threshold,
-        model,
-    )
+    band = band_for(float(result.get("confidence", 0)))
+    # default_model alone is no per-prompt signal (it was 55% of all injections
+    # and rarely followed): record the decision, never inject it.
+    pinned_default = result.get("tier") == "project_default"
+    if pinned_default:
+        band = "none"
     decision_id = "r_" + uuid.uuid4().hex[:10]
 
     decision = {
@@ -859,7 +838,6 @@ def main() -> int:
         "plan_mode": plan_mode,
         "fanout": fanout,
         "decision_id": decision_id,
-        "thresholds": {"auto": auto_threshold, "ask": ask_threshold},
         "project_config": project_cfg.get("_source"),
     }
     if fanout:
@@ -875,19 +853,27 @@ def main() -> int:
         return 0
 
     if band == "none":
-        audit_decision(prompt, session_id, turns, decision, "silent")
+        audit_decision(
+            prompt,
+            session_id,
+            turns,
+            decision,
+            "silent",
+            "project_default_inline" if pinned_default else None,
+        )
         return 0
 
     # Downhill-only: dispatching to the model the parent already runs (or a
     # dearer one) buys nothing and costs a cold-start brief. Audit it so the
-    # loop still sees the classification, but say nothing. The one exception is
-    # a pick the human made explicitly (`#model=fable`, a project rule): the
-    # parent cannot change its own model mid-session, so the dispatch IS the
-    # escalation mechanism and swallowing it would drop a direct instruction.
-    # Equal rank is always silent — there is nothing to escalate to.
+    # analyzers still see the classification, but say nothing. The one exception
+    # is an inline `#model=` tag: the parent cannot change its own model
+    # mid-session, so the dispatch IS the escalation mechanism and swallowing it
+    # would drop a direct instruction. router.json rules are standing config,
+    # not a per-prompt instruction, so they pass the same gate as the
+    # heuristics. Equal rank is always silent — there is nothing to escalate to.
     routed_rank = TIER_RANK.get(model, 99)
     parent_rank = TIER_RANK.get(parent_model, 99)
-    explicit = result.get("source") in ("override", "project_config")
+    explicit = result.get("source") == "override"
     if routed_rank == parent_rank or (routed_rank > parent_rank and not explicit):
         audit_decision(
             prompt, session_id, turns, decision, "silent", "same_or_higher_inline"
@@ -897,26 +883,20 @@ def main() -> int:
     budget_line = ""
     if ctx_tokens >= CTX_WARN_TOKENS and budget_gate(session_id, turns):
         budget_line = (
-            f"\ncontext={ctx_k}k over {CTX_WARN_TOKENS // 1000}k budget: delegate "
-            "all routable work to subagents; consider /wrap-session recap-only + "
-            "fresh session."
+            f"\ncontext {ctx_k}k > {CTX_WARN_TOKENS // 1000}k: delegate routable "
+            "work; consider /wrap-session + a fresh session."
         )
     fanout_clause = (
-        " fanout: decompose into independent subtasks and dispatch them in one message."
-        if fanout
-        else ""
+        " fanout: dispatch independent subtasks in one message." if fanout else ""
     )
 
-    # Everything the parent does NOT need in-context (tier, source, reason,
-    # thresholds) stays in the audit row; the injection carries only what
-    # changes behaviour.
+    # The auto-model-routing skill carries the procedure (cold-start brief,
+    # verify, escalate); the injection only names the worker and carries the
+    # decision block the skill parses. Tier, source, reason, and confidence stay
+    # in the audit row.
     msg = (
-        f"[auto-router] {model}/{result['effort']} "
-        f"conf={decision['confidence']:.2f} parent={parent_model} ctx={ctx_k}k\n"
         f'AUTO-ROUTE: Agent(subagent_type="auto-model-router:router-{model}") '
-        "with a cold-start brief (files, decisions so far); verify its result; "
-        "on failure re-dispatch one tier up. Skip only for a single read-only "
-        f"call.{fanout_clause}{budget_line}\n"
+        f"per auto-model-routing skill.{fanout_clause}{budget_line}\n"
         "<router-decision>"
         + json.dumps(
             {

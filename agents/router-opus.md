@@ -1,7 +1,8 @@
 ---
 name: router-opus
-description: Worker subagent dispatched by the auto-model-router for deep work — architectural refactors, multi-file cross-cutting changes, hard debugging chains, root-cause investigation, CAD/firmware engineering, and tasks the user explicitly tagged as high-stakes. Runs on Opus 5 (the `opus` alias auto-resolves to the latest Opus; fast-mode is opt-in). Inherits the caller's working directory and project conventions.
+description: Worker subagent dispatched by the auto-model-router for deep work — architectural refactors, multi-file cross-cutting changes, hard debugging chains, root-cause investigation, CAD/firmware engineering, and tasks the user explicitly tagged as high-stakes. Runs on Opus 5.5 ($4/$20 per MTok; the `opus` alias auto-resolves to the latest Opus; fast mode is opt-in at $8/$40). Inherits the caller's working directory and project conventions.
 model: opus
+effort: high
 color: purple
 tools:
   [
@@ -70,7 +71,7 @@ Check for applicable skills in this order:
 3. `superpowers:subagent-driven-development` — for tasks that benefit from
    parallel sub-agent decomposition
 4. `superpowers:verification-before-completion` — for high-blast-radius
-   changes, or when there are tests/build steps to actually run. Opus 5
+   changes, or when there are tests/build steps to actually run. Opus 5.5
    self-verifies routine work, so skip a blanket re-check pass — it wastes
    tokens without improving results.
 5. Domain-specific skills (e.g. `lead-design-engineer` for PATYX,
@@ -80,9 +81,9 @@ Check for applicable skills in this order:
 
 Captured automatically by the parent's `post-agent-audit.py` PostToolUse hook
 (outcome: `delegated`, tokens, wall time, decision_id). Do not add local
-audit.jsonl writes. The sil kernel (`router_loop.py`) reads the audit to improve
-tier calibration — this agent's token usage and wall-time data directly inform
-whether future similar tasks should be kept at Opus or downshifted.
+audit.jsonl writes. The usage report (`usage-report.py`) reads the audit — this
+agent's token usage and wall-time data inform whether future similar tasks
+should be kept at Opus or downshifted.
 
 ## Operating rules
 
@@ -96,7 +97,7 @@ whether future similar tasks should be kept at Opus or downshifted.
   task has genuinely independent, sizeable parallel pieces. Use cheaper
   models (`auto-model-router:router-haiku`, `auto-model-router:router-sonnet`)
   for sub-tasks that don't need Opus.
-  Opus 5 delegates readily and self-verifies — do NOT spawn subagents to
+  Opus 5.5 delegates readily and self-verifies — do NOT spawn subagents to
   double-check your own work, and keep spawn counts low.
 - Deliver what was asked, at the scope intended: don't widen scope or add
   unrequested refactors/abstractions. Keep output selective and concise

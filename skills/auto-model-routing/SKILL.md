@@ -15,25 +15,26 @@ context. This skill tells you how to honour it.
 The hook reads the parent session's own model off the transcript and only
 injects when the routed tier is **strictly cheaper** than yours
 (`haiku < sonnet < opus < fable`). A same-or-higher pick emits nothing, so you
-never see a decision block you should ignore on cost grounds. There is no `ask`
-band anymore — `band` is only `auto` (an AUTO-ROUTE block is present) or
-`none` (no block). A short follow-up prompt stays inline silently (the hook
-suppresses it), and a context-budget warning line rides along only at ≥200k
-input tokens.
+never see a decision block you should ignore on cost grounds. `band` is only
+`auto` (an AUTO-ROUTE block is present) or `none` (no block). The hook stays
+silent for harness events (task notifications, scheduled-task runs), short
+follow-ups, short lookups, a project's `default_model` pick, and any
+`router.json` rule that is not cheaper than you. Only an inline `#model=` tag
+may route up. A context-budget warning line rides along only at ≥600k input
+tokens.
 
-The injection looks like this:
+The injection looks like this — it names the worker and points here; the
+procedure (cold-start brief, verify, escalate) is below:
 
 ```
-[auto-router] sonnet/medium conf=0.82 parent=opus ctx=42k
-AUTO-ROUTE: Agent(subagent_type="auto-model-router:router-sonnet") with a
-cold-start brief (files, decisions so far); verify its result; on failure
-re-dispatch one tier up. Skip only for a single read-only call.
+AUTO-ROUTE: Agent(subagent_type="auto-model-router:router-sonnet") per auto-model-routing skill.
 <router-decision>{"decision_id":"r_...","model":"sonnet","effort":"medium","band":"auto","parent":"opus","ctx":42}</router-decision>
 ```
 
 The `<router-decision>` block carries `decision_id`, `model`, `effort`, `band`
 (always `auto` when present), `parent`, and `ctx` (input tokens ÷ 1000). The
-prose line carries extra directives: a `fanout:` clause and a ≥200k budget line.
+prose line can carry two extra directives: a `fanout:` clause and a ≥600k
+budget line.
 
 ## Procedure
 
@@ -79,8 +80,8 @@ plan as parallel waves, one `auto-model-router:router-<model>` agent per step.
 ### Branch C — no AUTO-ROUTE block
 
 No block means the hook decided routing buys nothing (same-or-higher tier, a
-follow-up, an opt-out, or below the route floor). Just do the work yourself on
-the current session model. Log nothing.
+follow-up, a short lookup, a project default, an opt-out, or below the route
+floor). Just do the work yourself on the current session model. Log nothing.
 
 ### Branch E — fanout
 
@@ -130,20 +131,23 @@ silently swallow a worker failure.
 ## Overriding the router
 
 Trust the user's intent above the classifier. If they said `do it yourself` /
-`don't delegate` / `stay on <model>`, do that. Force-routing via
-`#model=opus|sonnet|haiku|fable` is honoured (the hook emits `band=auto,
+`don't delegate` / `stay on <model>`, do that. Force-routing via an inline
+`#model=opus|sonnet|haiku|fable` tag is honoured (the hook emits `band=auto,
 confidence=1.0`, and dispatches even to a dearer model since only the human can
-change the session's own model). If the user is mid-iteration on the current
-model, prefer staying inline — the worker lacks that context.
+change the session's own model). A `router.json` rule gets no such exemption —
+it routes only when its model is cheaper than yours. If the user is
+mid-iteration on the current model, prefer staying inline — the worker lacks
+that context.
 
 ## Outcome logging
 
 The hooks handle it; you log nothing by hand. `post-agent-audit.py`
 (PostToolUse) records every `auto-model-router:router-*` dispatch automatically
-(outcome `delegated`, tokens, wall time, `decision_id`, `group_id`), and
-`reconcile-outcomes.py` (Stop) reconciles inline turns. The routing loop
-(`router_loop.py`, `/router-loop`) and `usage-report.py` (`/router-report`)
-consume that audit — do not duplicate or hand-tune it here.
+(outcome `delegated`, tokens, wall time, `agent_id`, `decision_id`,
+`group_id`); `subagent-stop-audit.py` (SubagentStop) adds the finished
+background worker's usage (outcome `worker_usage`); and `reconcile-outcomes.py`
+(Stop) reconciles inline turns. `usage-report.py` (`/router-report`) consumes
+that audit — do not duplicate or hand-tune it here.
 
 ## Failure modes to avoid
 
@@ -159,7 +163,7 @@ consume that audit — do not duplicate or hand-tune it here.
 
 | Model  | subagent_type                     | Use for                                                            |
 | ------ | --------------------------------- | ------------------------------------------------------------------ |
-| haiku  | `auto-model-router:router-haiku`  | Reads, lists, lookups, quick edits, classifications                |
+| haiku  | `auto-model-router:router-haiku`  | Bulk mechanical work, quick edits (explicit dispatch only)         |
 | sonnet | `auto-model-router:router-sonnet` | Routine refactors, doc/spec writing, prototype iteration           |
 | opus   | `auto-model-router:router-opus`   | Deep refactors, architecture, hard debugging, multi-file synthesis |
 | fable  | `auto-model-router:router-fable`  | Frontier-stakes synthesis, irreversible steps (manual/override)    |

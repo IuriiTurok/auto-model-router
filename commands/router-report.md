@@ -64,12 +64,9 @@ From the JSON, derive **2-4 concrete, data-driven** tweaks. Examples of the
 - **Quality:** if the router cohort's correction rate is meaningfully higher
   than inline for a tier/model → "bump tier X from Sonnet to Opus" or "tighten
   the heuristic that routed these".
-- **Cost:** if Haiku share is still low while many decisions are trivial
-  lookups → "lower a project's `default_model`" or "add a `.claude/router.json`
-  rule routing pattern Y to haiku".
-- **Ask-band:** read `~/.claude/cache/router/overrides.jsonl`; if the user
-  almost always overrides ask→opus for a pattern → "add a project rule so it
-  auto-routes opus and skips the prompt".
+- **Cost:** if the offload saving is small while many routed decisions stay
+  inline (low dispatch follow-through) → "add a `.claude/router.json` rule
+  routing pattern Y to sonnet/haiku" or "tighten the heuristic that over-fires".
 - **Time:** if multi-part prompts aren't fanning out (parallel batches ≈ 0
   while fanout decisions > 0) → "the parent isn't following Branch E — clarify
   the skill" .

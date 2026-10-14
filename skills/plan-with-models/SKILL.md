@@ -40,7 +40,7 @@ Optional fields when relevant:
 | Multi-file refactor (4+ files). Architectural decision. Hard debugging. New module design. CAD/firmware geometry. Cross-cutting performance work. | **opus**                                                             |
 | Verification (run tests, lint, type-check, smoke-test UI).                                                                                        | **haiku** if mechanical; **sonnet** if interpretation needed.        |
 | Final review / sanity check of the whole change.                                                                                                  | **sonnet** or **opus** depending on stakes.                          |
-| Frontier-stakes synthesis / irreversible high-blast-radius steps.                                                                                 | **fable** — 2x opus price; use sparingly. Parent usually IS Fable 5. |
+| Frontier-stakes synthesis / irreversible high-blast-radius steps.                                                                                 | **fable** — 2.5x Opus; use sparingly. Parent usually Opus.           |
 
 ## Effort tiers
 

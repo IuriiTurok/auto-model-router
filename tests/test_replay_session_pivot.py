@@ -30,7 +30,10 @@ fail = 0
 # --- classify_opus_turn ---
 fail += _check(
     "classify: low-effort deep-verb reason -> benign",
-    rsp.classify_opus_turn({"effort": "low", "reason": "deep-verb intent (plan/design)"}) == "benign",
+    rsp.classify_opus_turn(
+        {"effort": "low", "reason": "deep-verb intent (plan/design)"}
+    )
+    == "benign",
 )
 fail += _check(
     "classify: high effort -> real",
@@ -38,7 +41,10 @@ fail += _check(
 )
 fail += _check(
     "classify: migration rule reason -> real",
-    rsp.classify_opus_turn({"effort": "medium", "reason": "DB/schema migrations are high-blast-radius"}) == "real",
+    rsp.classify_opus_turn(
+        {"effort": "medium", "reason": "DB/schema migrations are high-blast-radius"}
+    )
+    == "real",
 )
 fail += _check(
     "classify: unknown reason -> real (conservative)",
@@ -49,31 +55,51 @@ fail += _check(
 nu = rsp.norm_usage({"input": 10, "output": 20, "cache_read": 5, "cache_write": 7})
 fail += _check(
     "norm_usage maps input/output -> *_tokens",
-    nu["input_tokens"] == 10 and nu["output_tokens"] == 20
-    and nu["cache_read"] == 5 and nu["cache_write"] == 7,
+    nu["input_tokens"] == 10
+    and nu["output_tokens"] == 20
+    and nu["cache_read"] == 5
+    and nu["cache_write"] == 7,
 )
 
 # --- analyze() on a synthetic audit log ---
 NOW = datetime.now(timezone.utc).isoformat()
 PROJ = "/Users/x/Code/demo/.claude/router.json"
-USAGE = {"model": "claude-opus-4-8", "input": 100, "output": 100,
-         "cache_read": 100000, "cache_write": 100000}
+USAGE = {
+    "model": "claude-opus-5-5",
+    "input": 100,
+    "output": 100,
+    "cache_read": 100000,
+    "cache_write": 100000,
+}
 
 
 def dec_row(sid, model, effort="medium", reason="x", proj=PROJ):
-    return {"ts": NOW, "session_id": sid,
-            "decision": {"model": model, "effort": effort, "reason": reason,
-                         "project_config": proj}}
+    return {
+        "ts": NOW,
+        "session_id": sid,
+        "decision": {
+            "model": model,
+            "effort": effort,
+            "reason": reason,
+            "project_config": proj,
+        },
+    }
 
 
 def usage_row(sid):
-    return {"ts": NOW, "session_id": sid, "outcome": "auto_inline_unattributed",
-            "usage": dict(USAGE)}
+    return {
+        "ts": NOW,
+        "session_id": sid,
+        "outcome": "auto_inline_unattributed",
+        "usage": dict(USAGE),
+    }
 
 
 rows = [
     # S1 cheap, no opus turn -> regret_none
-    dec_row("s1", "sonnet"), dec_row("s1", "sonnet"), usage_row("s1"),
+    dec_row("s1", "sonnet"),
+    dec_row("s1", "sonnet"),
+    usage_row("s1"),
     # S2 cheap, one BENIGN opus turn (low-effort deep-verb)
     dec_row("s2", "sonnet"),
     dec_row("s2", "opus", effort="low", reason="deep-verb intent (plan/design)"),
@@ -83,7 +109,8 @@ rows = [
     dec_row("s3", "opus", effort="high", reason="effort_score=4 (heavy)"),
     usage_row("s3"),
     # S4 opus-majority -> excluded from cheap_sessions
-    dec_row("s4", "opus", effort="high"), dec_row("s4", "opus", effort="high"),
+    dec_row("s4", "opus", effort="high"),
+    dec_row("s4", "opus", effort="high"),
     usage_row("s4"),
 ]
 
@@ -95,21 +122,80 @@ with tempfile.TemporaryDirectory() as d:
 
     res = rsp.analyze(path, days=30, candidate="sonnet", pricing=pricing)
     demo = res["projects"]["demo"]
-    fail += _check("analyze: 4 sessions, 3 cheap",
-                   demo["sessions"] == 4 and demo["cheap_sessions"] == 3)
-    fail += _check("analyze: regret split none/benign/real == 1/1/1",
-                   demo["regret_none"] == 1 and demo["regret_benign"] == 1
-                   and demo["regret_real"] == 1)
-    fail += _check("analyze: regret_real_rate == 33.3%",
-                   demo["regret_real_rate_pct"] == 33.3)
-    fail += _check("analyze: sonnet counterfactual saves money (save>0)",
-                   demo["save_usd_per_wk"] > 0)
+    fail += _check(
+        "analyze: 4 sessions, 3 cheap",
+        demo["sessions"] == 4 and demo["cheap_sessions"] == 3,
+    )
+    fail += _check(
+        "analyze: regret split none/benign/real == 1/1/1",
+        demo["regret_none"] == 1
+        and demo["regret_benign"] == 1
+        and demo["regret_real"] == 1,
+    )
+    fail += _check(
+        "analyze: regret_real_rate == 33.3%", demo["regret_real_rate_pct"] == 33.3
+    )
+    fail += _check(
+        "analyze: sonnet counterfactual saves money (save>0)",
+        demo["save_usd_per_wk"] > 0,
+    )
 
     # Identity: candidate == the realized model family -> cf == realized.
     res_id = rsp.analyze(path, days=30, candidate="opus", pricing=pricing)
     d_id = res_id["projects"]["demo"]
-    fail += _check("identity: candidate=opus -> cf == realized (save 0)",
-                   abs(d_id["save_usd_per_wk"]) < 1e-9)
+    fail += _check(
+        "identity: candidate=opus -> cf == realized (save 0)",
+        abs(d_id["save_usd_per_wk"]) < 1e-9,
+    )
+
+# Rotated audit files are read too: splitting the same rows between a rotated
+# file and the live log yields the identical analysis.
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "audit.jsonl")
+    with open(f"{path}.20260101T000000Z", "w") as f:
+        for r in rows[:6]:
+            f.write(json.dumps(r) + "\n")
+    with open(path, "w") as f:
+        for r in rows[6:]:
+            f.write(json.dumps(r) + "\n")
+    with open(f"{path}.bak", "w") as f:
+        f.write(json.dumps(dec_row("ghost", "sonnet")) + "\n")
+    split = rsp.analyze(path, days=30, candidate="sonnet", pricing=pricing)
+    fail += _check(
+        "rotated: rows split across rotated + live file analyze the same",
+        split["projects"] == res["projects"],
+    )
+
+# A `worker_usage` row (subagent-stop-audit.py: session_id + usage, no model
+# inside the usage dict) must not feed the gate. Ingested, it would add $0 to
+# realized_usd (no model to price) but candidate-priced tokens to cf_usd,
+# biasing save$/wk down.
+worker_usage_row = {
+    "ts": NOW,
+    "session_id": "s1",
+    "outcome": "worker_usage",
+    "kind": "router",
+    "model": "sonnet",
+    "agent_id": "bg1",
+    "model_actual": "claude-sonnet-5-5",
+    "usage": {
+        "tokens_in": 1000,
+        "tokens_out": 1000,
+        "cache_read": 50_000_000,
+        "cache_write": 1_000_000,
+    },
+}
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "audit.jsonl")
+    with open(path, "w") as f:
+        for r in rows + [worker_usage_row]:
+            f.write(json.dumps(r) + "\n")
+    with_worker = rsp.analyze(path, days=30, candidate="sonnet", pricing=pricing)
+    fail += _check(
+        "worker_usage row is ignored (analysis identical to the log without it)",
+        with_worker["projects"] == res["projects"]
+        and with_worker["total"] == res["total"],
+    )
 
 print(f"--- replay_session_pivot: {'OK' if fail == 0 else f'{fail} FAILED'}")
 sys.exit(1 if fail else 0)

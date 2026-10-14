@@ -8,7 +8,7 @@ session's injected `auto`-band decisions that has no terminal outcome row
 (a `delegated` row from post-agent-audit, a hand-written skip row, or a prior
 reconcile), it appends one `auto_inline_unattributed` row. That converts the
 large "auto decided, outcome unknown" bucket into an explicit, measurable
-outcome so /router-report and router_loop.py stop flying blind on follow-through.
+outcome so /router-report stops flying blind on follow-through.
 
 Correlation uses the `session_id` that auto-router.py now stamps onto every
 injected row, plus the `decision_id` carried by outcome rows (globally unique).
@@ -48,6 +48,10 @@ TERMINAL_OUTCOMES = {
 # Tail-read cap for the session transcript (usage summation). Cheap and
 # generous — a single turn's worth of records rarely exceeds this.
 TRANSCRIPT_TAIL_BYTES = 2_000_000
+
+# Zero-usage placeholder records (API errors, "No response requested.") are
+# written under this model; they are not a real turn.
+SYNTHETIC_MODEL = "<synthetic>"
 
 
 def _is_human_turn(rec: dict) -> bool:
@@ -103,30 +107,47 @@ def sum_inline_usage(transcript_path: str | None) -> dict | None:
         if _is_human_turn(rec):
             last_human_idx = i
 
-    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    # One API response is written once per content block, every record carrying
+    # the same message.id and usage (a 2.8x overcount when summed per record).
+    # Fold per id, taking the max of each field since output grows while
+    # streaming; a record without an id stands alone.
+    messages = {}  # message.id -> counters, in turn order
     model = None
-    last_turn_ctx = None
-    for rec in records[last_human_idx + 1 :]:
+    for i, rec in enumerate(records[last_human_idx + 1 :]):
         if rec.get("type") != "assistant":
             continue
         msg = rec.get("message") or {}
+        if msg.get("model") == SYNTHETIC_MODEL:
+            # Would otherwise win as the last-seen model and zero the last
+            # turn's context size.
+            continue
         usage = msg.get("usage") or {}
         if not usage:
             continue
-        tin = usage.get("input_tokens") or 0
-        tout = usage.get("output_tokens") or 0
-        cread = usage.get("cache_read_input_tokens") or 0
-        ccreate = usage.get("cache_creation_input_tokens") or 0
-        totals["input"] += tin
-        totals["output"] += tout
-        totals["cache_read"] += cread
-        totals["cache_write"] += ccreate
+        cur = messages.setdefault(
+            msg.get("id") or f"_{i}",
+            {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+        )
+        cur["input"] = max(cur["input"], usage.get("input_tokens") or 0)
+        cur["output"] = max(cur["output"], usage.get("output_tokens") or 0)
+        cur["cache_read"] = max(
+            cur["cache_read"], usage.get("cache_read_input_tokens") or 0
+        )
+        cur["cache_write"] = max(
+            cur["cache_write"], usage.get("cache_creation_input_tokens") or 0
+        )
         if msg.get("model"):
             model = msg.get("model")
-        last_turn_ctx = tin + cread + ccreate
 
-    if last_turn_ctx is None:
+    if not messages:
         return None
+
+    totals = {
+        k: sum(m[k] for m in messages.values())
+        for k in ("input", "output", "cache_read", "cache_write")
+    }
+    last = list(messages.values())[-1]
+    last_turn_ctx = last["input"] + last["cache_read"] + last["cache_write"]
 
     return {
         "model": model,

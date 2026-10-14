@@ -23,20 +23,24 @@ Print a summary of recent auto-router activity.
 
    ```bash
    python3 - <<'PY'
-   import json, os, time, collections
+   import glob, json, os, re, collections
    from datetime import datetime, timezone, timedelta
    path = os.path.expanduser("~/.claude/cache/router/audit.jsonl")
+   # the live log plus its rotated audit.jsonl.<stamp> files, oldest first
+   paths = sorted(p for p in glob.glob(path + ".*") if re.search(r"\.\d{8}T\d{6}Z$", p)) + [path]
    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
    by_model = collections.Counter()
    by_band = collections.Counter()
    total = 0
-   with open(path) as f:
-       for line in f:
+   for p in paths:
+       if not os.path.exists(p): continue
+       for line in open(p):
            try: r = json.loads(line)
            except: continue
+           if not r.get("decision"): continue
            ts = datetime.fromisoformat(r["ts"].replace("Z","+00:00"))
            if ts < cutoff: continue
-           d = r.get("decision") or {}
+           d = r["decision"]
            by_model[d.get("model","?")] += 1
            by_band[d.get("band","?")] += 1
            total += 1
@@ -66,20 +70,12 @@ Print a summary of recent auto-router activity.
    batches detected," show `Parallelism: none yet` — fan-out hasn't fired
    (or predates `group_id` capture).
 
-4. **Cache size**:
-
-   ```bash
-   ls ~/.claude/cache/router/*.json 2>/dev/null | wc -l
-   ```
-
-   Report as: `<N> cached classifications`.
-
-5. If `audit.jsonl` is missing or empty, print:
+4. If `audit.jsonl` is missing or empty, print:
    `No auto-router activity yet. Send a prompt to see decisions.`
 
-6. **Realized cost + follow-through** — this command's own scan above is
+5. **Realized cost + follow-through** — this command's own scan above is
    decision-only (what the router *decided*). For what actually happened —
-   real $ spent per dispatch, not the all-Opus counterfactual — defer to the
+   real $ spent per dispatch, not the vs-parent counterfactual — defer to the
    fuller report:
 
    ```bash

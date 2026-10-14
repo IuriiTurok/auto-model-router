@@ -73,16 +73,23 @@ for text, want in CASES:
 
 
 # ── 2. Pricing math ─────────────────────────────────────────────────────────
-# opus(1000,2000)=0.055 ; haiku(1000,2000)=0.011 ; saved=0.044
-check("pricing opus cost", abs(pricing.cost("opus", 1000, 2000) - 0.055) < 1e-9)
-check("pricing haiku cost", abs(pricing.cost("haiku", 1000, 2000) - 0.011) < 1e-9)
+# Aliases price as the current 5.5 lineup: opus(1000,2000)=0.044 ; haiku=0.0011
+USAGE_1K_2K = {"tokens_in": 1000, "tokens_out": 2000}
 check(
-    "pricing saving haiku vs opus",
-    abs(pricing.counterfactual_saving("haiku", 1000, 2000) - 0.044) < 1e-9,
+    "pricing opus cost",
+    abs(pricing.cost_usd("opus", USAGE_1K_2K) - 0.044) < 1e-9,
 )
 check(
-    "pricing saving opus vs opus is 0",
-    pricing.counterfactual_saving("opus", 9, 9) == 0.0,
+    "pricing haiku cost",
+    abs(pricing.cost_usd("haiku", USAGE_1K_2K) - 0.0011) < 1e-9,
+)
+check(
+    "pricing saving haiku under an opus parent",
+    abs(pricing.saving_vs_parent("haiku", "opus", USAGE_1K_2K) - 0.0429) < 1e-9,
+)
+check(
+    "pricing saving opus under an opus parent is 0",
+    pricing.saving_vs_parent("opus", "opus", USAGE_1K_2K) == 0.0,
 )
 check("model_family opus", pricing.model_family("claude-opus-4-8") == "opus")
 check("model_family unknown -> None", pricing.model_family("gpt-4") is None)
@@ -90,74 +97,88 @@ check("model_family unknown -> None", pricing.model_family("gpt-4") is None)
 
 # ── 3. End-to-end analyze() over a synthetic session ────────────────────────
 ts = now_iso()
+PROJECTS = os.environ["CC_ROUTER_PROJECTS_DIR"]
+OPUS_55 = "claude-opus-5-5"
+HAIKU_55 = "claude-haiku-5-5"
+
+
+def assistant(msg_id, model, usage, content, stamp=ts):
+    message = {"model": model, "usage": usage, "content": content}
+    if msg_id:
+        message["id"] = msg_id
+    return {"type": "assistant", "timestamp": stamp, "message": message}
+
+
+dispatch_block = {
+    "type": "tool_use",
+    "name": "Agent",
+    "input": {"subagent_type": "router-haiku", "description": "x"},
+}
 session = [
     {
         "type": "user",
         "timestamp": ts,
         "message": {"content": "Please refactor the auth module"},
     },
-    {
-        "type": "assistant",
-        "timestamp": ts,
-        "message": {
-            "model": "claude-haiku-4-5-20251001",
-            "usage": {"input_tokens": 1000, "output_tokens": 2000},
-            "content": [
-                {"type": "text", "text": "delegating"},
-                {
-                    "type": "tool_use",
-                    "name": "Agent",
-                    "input": {"subagent_type": "router-haiku", "description": "x"},
-                },
-            ],
-        },
-    },
+    # One API response, written once per content block with the same id and
+    # usage (output grows while streaming): must be counted once.
+    assistant(
+        "m1",
+        OPUS_55,
+        {"input_tokens": 1000, "output_tokens": 500},
+        [{"type": "text", "text": "delegating"}],
+    ),
+    assistant(
+        "m1",
+        OPUS_55,
+        {"input_tokens": 1000, "output_tokens": 2000},
+        [dispatch_block],
+    ),
     {
         "type": "user",
         "timestamp": ts,
         "message": {"content": "no, that's wrong, revert it"},
     },
-    {
-        "type": "assistant",
-        "timestamp": ts,
-        "message": {
-            "model": "claude-opus-4-8",
-            "usage": {"input_tokens": 500, "output_tokens": 1000},
-            "content": [{"type": "text", "text": "done inline"}],
-        },
-    },
+    assistant(
+        "m2",
+        OPUS_55,
+        {"input_tokens": 500, "output_tokens": 1000},
+        [{"type": "text", "text": "done inline"}],
+    ),
     {"type": "user", "timestamp": ts, "message": {"content": "perfect, thanks!"}},
 ]
-write_jsonl(
-    os.path.join(os.environ["CC_ROUTER_PROJECTS_DIR"], "proj", "s1.jsonl"), session
-)
+write_jsonl(os.path.join(PROJECTS, "proj", "s1.jsonl"), session)
 
-# a subagent transcript — its tokens should count toward totals but NOT as a session
+# A subagent transcript of session s1 — its tokens count toward totals (and are
+# priced against s1's parent model) but it is NOT a session.
 write_jsonl(
-    os.path.join(
-        os.environ["CC_ROUTER_PROJECTS_DIR"], "proj", "subagents", "agent-x.jsonl"
-    ),
+    os.path.join(PROJECTS, "proj", "s1", "subagents", "agent-x.jsonl"),
     [
-        {
-            "type": "assistant",
-            "timestamp": ts,
-            "message": {
-                "model": "claude-haiku-4-5-20251001",
-                "usage": {"input_tokens": 300, "output_tokens": 400},
-                "content": [{"type": "text", "text": "sub work"}],
+        assistant(
+            "w1",
+            HAIKU_55,
+            {
+                "input_tokens": 300_000,
+                "output_tokens": 400_000,
+                "cache_read_input_tokens": 20_000_000,
             },
-        }
+            [{"type": "text", "text": "sub work"}],
+        )
     ],
 )
 
-data = ur.analyze(days=7, projects_dir=os.environ["CC_ROUTER_PROJECTS_DIR"])
+data = ur.analyze(days=7, projects_dir=PROJECTS)
 
 check(
-    "tokens: haiku in = 1300 (session 1000 + sub 300)",
-    data["tokens"]["haiku"]["in"] == 1300,
+    "tokens: opus in = 1500 (m1 counted once + m2)",
+    data["tokens"]["opus"]["in"] == 1500,
 )
-check("tokens: haiku out = 2400", data["tokens"]["haiku"]["out"] == 2400)
-check("tokens: opus in = 500", data["tokens"]["opus"]["in"] == 500)
+check(
+    "tokens: opus out = 3000 (m1's final 2000, not 2500, + m2's 1000)",
+    data["tokens"]["opus"]["out"] == 3000,
+)
+check("tokens: haiku in = 300000 (subagent)", data["tokens"]["haiku"]["in"] == 300_000)
+check("tokens: haiku out = 400000", data["tokens"]["haiku"]["out"] == 400_000)
 check("sessions_scanned = 1 (subagent file excluded)", data["sessions_scanned"] == 1)
 check("cohort router correction = 1", data["cohort"]["router"].get("correction") == 1)
 check("cohort inline approval = 1", data["cohort"]["inline"].get("approval") == 1)
@@ -168,11 +189,19 @@ check(
 )
 
 rep = ur.build_report(data)
-# saved: haiku(1300,2400) vs opus + sub already folded; opus slice saves 0.
-expected_saved = round(pricing.counterfactual_saving("haiku", 1300, 2400), 2)
+# The subagent ran on haiku under s1's opus parent: saved = what its usage
+# (cache included) would have cost on opus 5.5 minus what it cost on haiku 5.5.
+# opus: 300k*4 + 400k*20 + 20M*0.20 = 1.2+8+4 = 13.2 ; haiku: 0.03+0.2+0.2 = 0.43
 check(
-    f"cost saved ~= {expected_saved}",
-    abs(rep["cost"]["est_saved_vs_opus_usd"] - expected_saved) < 0.01,
+    "cost saved vs the opus parent = 12.77",
+    rep["cost"]["est_saved_vs_parent_usd"] == 12.77
+    and rep["cost"]["est_offload_saved_usd"] == 12.77
+    and rep["cost"]["worker_premium_usd"] == 0.0,
+)
+check(
+    "no all-Opus baseline key survives in the cost KPI",
+    "est_saved_vs_opus_usd" not in rep["cost"]
+    and "parent_model_premium_usd" not in rep["cost"],
 )
 check(
     "quality router correction rate = 100%",
@@ -183,6 +212,72 @@ check(
     rep["quality"]["inline"]["approval_rate_pct"] == 100.0,
 )
 check("time: 1 session measured", rep["time"]["sessions"] == 1)
+
+
+# ── 3b. Savings are priced against each session's own parent ────────────────
+SONNET_55 = "claude-sonnet-5-5"
+FABLE_51 = "claude-fable-5-1"
+WORKER_USAGE = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+parent_usage = {"input_tokens": 10, "output_tokens": 10}
+with tempfile.TemporaryDirectory() as pdir:
+    stamp = now_iso()
+    # session on an opus parent, with a haiku worker and a (dearer) fable worker
+    write_jsonl(
+        os.path.join(pdir, "p", "s_opus.jsonl"),
+        [assistant("o1", OPUS_55, parent_usage, [], stamp)],
+    )
+    write_jsonl(
+        os.path.join(pdir, "p", "s_opus", "subagents", "agent-1.jsonl"),
+        [assistant("h1", HAIKU_55, WORKER_USAGE, [], stamp)],
+    )
+    write_jsonl(
+        os.path.join(pdir, "p", "s_opus", "subagents", "agent-3.jsonl"),
+        [assistant("f1", FABLE_51, WORKER_USAGE, [], stamp)],
+    )
+    # session on a SONNET parent with the same haiku worker usage
+    write_jsonl(
+        os.path.join(pdir, "p", "s_sonnet.jsonl"),
+        [assistant("s1", SONNET_55, parent_usage, [], stamp)],
+    )
+    write_jsonl(
+        os.path.join(pdir, "p", "s_sonnet", "subagents", "agent-2.jsonl"),
+        [assistant("h2", HAIKU_55, WORKER_USAGE, [], stamp)],
+    )
+    cost = ur.build_report(ur.analyze(days=7, projects_dir=pdir))["cost"]
+    haiku_vs_opus = pricing.saving_vs_parent("haiku", "opus", WORKER_USAGE)
+    haiku_vs_sonnet = pricing.saving_vs_parent("haiku", "sonnet", WORKER_USAGE)
+    fable_vs_opus = pricing.saving_vs_parent("fable", "opus", WORKER_USAGE)
+    check(
+        "per-session parent: offload = haiku-vs-opus + haiku-vs-sonnet",
+        abs(cost["est_offload_saved_usd"] - round(haiku_vs_opus + haiku_vs_sonnet, 2))
+        < 0.006,
+    )
+    check(
+        "per-session parent: a fable worker under opus is a negative premium",
+        fable_vs_opus < 0
+        and abs(cost["worker_premium_usd"] - round(fable_vs_opus, 2)) < 0.006,
+    )
+    check(
+        "per-session parent: net = offload + premium",
+        abs(
+            cost["est_saved_vs_parent_usd"]
+            - (cost["est_offload_saved_usd"] + cost["worker_premium_usd"])
+        )
+        < 0.006,
+    )
+
+with tempfile.TemporaryDirectory() as pdir:
+    # A session's own (top-level) tokens never count as savings, even when the
+    # session runs on a cheap model.
+    write_jsonl(
+        os.path.join(pdir, "p", "only_haiku.jsonl"),
+        [assistant("x1", HAIKU_55, WORKER_USAGE, [], now_iso())],
+    )
+    cost = ur.build_report(ur.analyze(days=7, projects_dir=pdir))["cost"]
+    check(
+        "a cheap parent's own tokens save nothing",
+        cost["est_saved_vs_parent_usd"] == 0.0 and cost["tokens_out"] == 1_000_000,
+    )
 
 
 # ── 4. analyze_audit() join + parallelism ───────────────────────────────────
@@ -276,7 +371,9 @@ check(
 )
 check(
     "assistant_router_dispatch matches namespaced auto-model-router:router-*",
-    ur.assistant_router_dispatch(_agent_dispatch_rec("auto-model-router:router-sonnet")),
+    ur.assistant_router_dispatch(
+        _agent_dispatch_rec("auto-model-router:router-sonnet")
+    ),
 )
 check(
     "assistant_router_dispatch rejects a non-router subagent_type",
@@ -452,6 +549,193 @@ audit_empty = ur.analyze_audit(days=1, end=far_past_end)
 check(
     "analyze_audit(end=...) excludes rows outside the shifted window",
     audit_empty["decisions"] == 0,
+)
+
+
+# ── 8. Rotated audit files are read too ─────────────────────────────────────
+before = ur.analyze_audit(days=7)
+rotated_path = f"{ur.AUDIT_LOG}.20260101T000000Z"
+write_jsonl(
+    rotated_path,
+    [
+        {
+            "ts": now_iso(),
+            "outcome": "injected",
+            "decision": {"band": "auto", "model": "haiku", "decision_id": "r_rot1"},
+        },
+        {
+            "ts": now_iso(),
+            "outcome": "silent",
+            "decision": {"band": "none", "model": "sonnet", "decision_id": "r_rot2"},
+        },
+        {"ts": now_iso(), "outcome": "delegated", "model": "haiku", "wall_ms": 10},
+    ],
+)
+# a stray file that merely shares the prefix is not a rotation
+with open(f"{ur.AUDIT_LOG}.bak", "w") as f:
+    f.write(json.dumps({"ts": now_iso(), "outcome": "silent", "decision": {}}) + "\n")
+after = ur.analyze_audit(days=7)
+check(
+    "rotated audit file: its 2 decisions are counted",
+    after["decisions"] == before["decisions"] + 2,
+)
+check(
+    "rotated audit file: its dispatch row is counted",
+    after["reconciliation"]["dispatched_total"]
+    == before["reconciliation"]["dispatched_total"] + 1,
+)
+check(
+    "a non-rotation file sharing the prefix (.bak) is ignored",
+    after["decisions"] == before["decisions"] + 2,
+)
+check(
+    "audit_paths: rotated first (oldest first), live log last",
+    ur.audit_paths(ur.AUDIT_LOG) == [rotated_path, ur.AUDIT_LOG],
+)
+os.remove(rotated_path)
+os.remove(f"{ur.AUDIT_LOG}.bak")
+
+
+# ── 9. Background workers: usage arrives on the SubagentStop row ────────────
+before_audit = ur.analyze_audit(days=7)
+before = before_audit["realized"]
+BG_USAGE = {"tokens_in": 1000, "tokens_out": 500, "cache_read": 10000, "cache_write": 0}
+FG_USAGE = {"tokens_in": 200, "tokens_out": 100, "cache_read": 0, "cache_write": 0}
+with open(ur.AUDIT_LOG, "a") as f:
+    for row in [
+        # background worker: the launch row has no usage, the stop row does
+        {
+            "ts": now_iso(),
+            "outcome": "delegated",
+            "kind": "router",
+            "agent_id": "bg1",
+            "model": "sonnet",
+        },
+        {
+            "ts": now_iso(),
+            "outcome": "worker_usage",
+            "kind": "router",
+            "agent_id": "bg1",
+            "model_actual": "claude-sonnet-5-5",
+            "usage": BG_USAGE,
+        },
+        # foreground worker: BOTH rows carry its usage; count it once
+        {
+            "ts": now_iso(),
+            "outcome": "worker_usage",
+            "kind": "router",
+            "agent_id": "fg1",
+            "model_actual": "claude-opus-5-5",
+            "usage": FG_USAGE,
+        },
+        {
+            "ts": now_iso(),
+            "outcome": "delegated",
+            "kind": "router",
+            "agent_id": "fg1",
+            "model": "opus",
+            "model_actual": "claude-opus-5-5",
+            "usage": FG_USAGE,
+        },
+    ]:
+        f.write(json.dumps(row) + "\n")
+after_audit = ur.analyze_audit(days=7)
+after = after_audit["realized"]
+exp_added = pricing.cost_usd("claude-sonnet-5-5", BG_USAGE) + pricing.cost_usd(
+    "claude-opus-5-5", FG_USAGE
+)
+check(
+    "worker_usage: background usage counted, foreground counted once",
+    abs((after["total_cost_usd"] - before["total_cost_usd"]) - exp_added) < 1e-3,
+)
+check(
+    "worker_usage: lands in the router/sonnet bucket with all four token kinds",
+    after["by_kind_model"]["router/sonnet"]["tokens"]
+    - before["by_kind_model"].get("router/sonnet", {"tokens": 0})["tokens"]
+    == sum(BG_USAGE.values()),
+)
+check(
+    "worker_usage rows are not dispatches (only the 2 delegated rows count)",
+    after_audit["reconciliation"]["dispatched_total"]
+    == before_audit["reconciliation"]["dispatched_total"] + 2,
+)
+
+
+# ── 10. A subagent whose session transcript is out of the window ────────────
+with tempfile.TemporaryDirectory() as pdir:
+    write_jsonl(
+        os.path.join(pdir, "p", "top.jsonl"),
+        [assistant("t1", OPUS_55, {"input_tokens": 50, "output_tokens": 50}, [])],
+    )
+    write_jsonl(
+        os.path.join(pdir, "p", "gone", "subagents", "agent-9.jsonl"),
+        [assistant("g1", HAIKU_55, WORKER_USAGE, [])],
+    )
+    check(
+        "owner_transcript: subagent file -> <session>.jsonl, top-level -> itself",
+        ur.owner_transcript(
+            os.path.join(pdir, "p", "gone", "subagents", "agent-9.jsonl")
+        )
+        == os.path.join(pdir, "p", "gone.jsonl")
+        and ur.owner_transcript(os.path.join(pdir, "p", "top.jsonl"))
+        == os.path.join(pdir, "p", "top.jsonl"),
+    )
+    cost = ur.build_report(ur.analyze(days=7, projects_dir=pdir))["cost"]
+    check(
+        "orphan subagent is priced against the window's dominant parent (opus)",
+        abs(
+            cost["est_offload_saved_usd"]
+            - round(pricing.saving_vs_parent("haiku", "opus", WORKER_USAGE), 2)
+        )
+        < 0.006,
+    )
+
+
+# ── 11. Dispatch follow-through counts only auto-band decisions ─────────────
+# Band-none rows that happen to name a cheaper model than the parent (the
+# haiku fallback, project_default_inline) can never be injected, so they are
+# not follow-through candidates.
+before_audit = ur.analyze_audit(days=7)
+before_ft = before_audit["realized"]["dispatch_follow_through_pct"]
+with open(ur.AUDIT_LOG, "a") as f:
+    for row in [
+        {
+            "ts": now_iso(),
+            "outcome": "silent",
+            "decision": {
+                "band": "none",
+                "tier": "default",
+                "model": "haiku",
+                "parent": "opus",
+                "decision_id": "r_none_haiku",
+            },
+        },
+        {
+            "ts": now_iso(),
+            "outcome": "silent",
+            "outcome_hint": "project_default_inline",
+            "decision": {
+                "band": "none",
+                "tier": "project_default",
+                "model": "sonnet",
+                "parent": "opus",
+                "decision_id": "r_none_default",
+            },
+        },
+    ]:
+        f.write(json.dumps(row) + "\n")
+after_audit = ur.analyze_audit(days=7)
+check(
+    "follow-through baseline is a real number (r_c followed of r_c + r_d)",
+    before_ft == 50.0,
+)
+check(
+    "band-none cheaper-than-parent rows are counted as decisions...",
+    after_audit["decisions"] == before_audit["decisions"] + 2,
+)
+check(
+    "...but are not follow-through candidates (still 50.0, not 25.0)",
+    after_audit["realized"]["dispatch_follow_through_pct"] == before_ft,
 )
 
 

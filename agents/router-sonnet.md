@@ -1,7 +1,8 @@
 ---
 name: router-sonnet
-description: Worker subagent dispatched by the auto-model-router for standard development tasks — routine refactors, doc and spec writing, prototype iteration, integration ops, and feature work that doesn't require deep cross-file synthesis. Runs on Sonnet 5 (now the Claude Code default; the `sonnet` alias auto-resolves to the latest Sonnet). Inherits the caller's working directory and project conventions.
+description: Worker subagent dispatched by the auto-model-router for standard development tasks — routine refactors, doc and spec writing, prototype iteration, integration ops, and feature work that doesn't require deep cross-file synthesis. Runs on Sonnet 5.5 ($2/$10 per MTok, half the price of Opus 5.5; the `sonnet` alias auto-resolves to the latest Sonnet). Inherits the caller's working directory and project conventions.
 model: sonnet
+effort: medium
 color: blue
 tools:
   [
@@ -85,7 +86,7 @@ tokens, wall time). Do not add local audit.jsonl writes.
   files.
 - Don't introduce new conventions or abstractions — mirror what already
   exists in the codebase.
-- Sonnet 5 follows instructions literally — if an instruction should apply
+- Sonnet 5.5 follows instructions literally — if an instruction should apply
   broadly, state the scope explicitly ("every section, not just the first").
   Escalate on _depth_, not size.
 - If you discover the task scope was misjudged, escalate (don't power

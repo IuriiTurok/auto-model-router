@@ -79,41 +79,38 @@ else
     exit 1
   fi
 
-  # Run the classifier and parse the decision in one python call.
+  # Run the classifier and parse the decision in one python call. The hook only
+  # injects context for picks cheaper than its (assumed) parent, so its stdout
+  # is empty for most prompts; the audit row it always writes carries the full
+  # decision. Point it at a throwaway cache so this dry classification never
+  # lands in the real audit log.
   decision_line=$(PROMPT="$prompt" ROUTER_HOOK="$ROUTER_HOOK" python3 <<'PY'
-import json, os, subprocess, sys
+import json, os, subprocess, sys, tempfile
 
 prompt = os.environ["PROMPT"]
 hook = os.environ["ROUTER_HOOK"]
 
-proc = subprocess.run(
-    ["python3", hook],
-    input=json.dumps({"prompt": prompt}).encode(),
-    capture_output=True, timeout=10,
-)
-if not proc.stdout:
-    sys.exit("cc-route: classifier returned no output (was the prompt too short?)")
+with tempfile.TemporaryDirectory() as cache:
+    subprocess.run(
+        ["python3", hook],
+        input=json.dumps({"prompt": prompt}).encode(),
+        capture_output=True, timeout=10,
+        env={**os.environ, "CC_ROUTER_CACHE_DIR": cache},
+    )
+    try:
+        with open(os.path.join(cache, "audit.jsonl")) as f:
+            d = json.loads(f.readlines()[-1])["decision"]
+    except (OSError, IndexError, ValueError, KeyError):
+        sys.exit("cc-route: classifier wrote no decision (prompt too short, or routing disabled?)")
 
-try:
-    out = json.loads(proc.stdout)
-except json.JSONDecodeError:
-    sys.exit("cc-route: classifier output was not JSON")
-
-ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
-start = ctx.find("<router-decision>")
-end = ctx.find("</router-decision>")
-if start == -1 or end == -1:
-    sys.exit("cc-route: no <router-decision> block in classifier output")
-
-d = json.loads(ctx[start + len("<router-decision>"):end].strip())
 print(
     "|".join([
-        d.get("tier", "?"),
-        d.get("model", "?"),
-        d.get("effort", "?"),
-        f"{float(d.get('confidence', 0)):.2f}",
-        d.get("band", "?"),
-        (d.get("reason", "") or "").replace("|", "/"),
+        d.get("tier") or "?",
+        d.get("model") or "?",
+        d.get("effort") or "?",
+        f"{float(d.get('confidence') or 0):.2f}",
+        d.get("band") or "?",
+        (d.get("reason") or "").replace("|", "/"),
     ]),
     end="",
 )
@@ -130,22 +127,14 @@ if [ "$dry_run" -eq 1 ]; then
   exit 0
 fi
 
-if [ "$band" = "ask" ]; then
-  printf 'Confidence is %s. Launch with --model %s anyway? [Y/n/o(pus)/s(onnet)/h(aiku)] ' \
-    "$confidence" "$model" >&2
-  read -r answer || answer=""
-  case "${answer:-y}" in
-    [Yy]*|"") ;;
-    [Oo]*) model="opus" ;;
-    [Ss]*) model="sonnet" ;;
-    [Hh]*) model="haiku" ;;
-    *) echo "cc-route: aborted" >&2; exit 0 ;;
-  esac
-fi
-
 if ! command -v claude >/dev/null 2>&1; then
   echo "cc-route: 'claude' CLI not on PATH; cannot launch session" >&2
   exit 1
+fi
+
+# band=none: the router has no confident pick, so don't override the model.
+if [ "$band" = "none" ]; then
+  exec claude "${passthrough[@]+"${passthrough[@]}"}" "$prompt"
 fi
 
 exec claude --model "$model" "${passthrough[@]+"${passthrough[@]}"}" "$prompt"

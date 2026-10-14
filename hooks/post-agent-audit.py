@@ -13,9 +13,11 @@ Closes the loop with auto-router.py:
       - every other subagent_type (Explore, Plan, general-purpose,
         code-reviewer, ...) is a native dispatch and gets
         `outcome: "native_dispatch"`.
-  - Both kinds also record agent_type, model_actual (read from the
+  - Both kinds also record agent_id, agent_type, model_actual (read from the
     subagent's own transcript), total_tokens, duration_ms, and usage{}
-    pulled from the Agent tool_response.
+    pulled from the Agent tool_response. A background dispatch returns at
+    launch with no usage; subagent-stop-audit.py (SubagentStop) records the
+    finished worker's usage, joined on this row's agent_id.
 
 Idempotent and silent — never blocks the tool call. If the payload
 shape is not what we expect, exits 0 without writing anything.
@@ -47,6 +49,10 @@ ROUTER_TYPE_RE = re.compile(r"^(?:auto-model-router:)?router-(.+)$")
 # Tail-read cap for subagent transcript lookups (model_actual). Cheap and
 # generous — subagent transcripts are rarely bigger than this.
 TRANSCRIPT_TAIL_BYTES = 2_000_000
+
+# Zero-usage placeholder records (API errors, "No response requested.") are
+# written under this model; they are never a transcript's real model.
+SYNTHETIC_MODEL = "<synthetic>"
 
 
 def classify_subagent(subagent_type: str) -> tuple[str, str | None]:
@@ -100,7 +106,7 @@ def read_model_actual(
             continue
         if rec.get("type") == "assistant":
             model = (rec.get("message") or {}).get("model")
-            if model:
+            if model and model != SYNTHETIC_MODEL:
                 last_model = model
     return last_model
 
@@ -262,6 +268,10 @@ def main() -> int:
     agent_id = None
     if isinstance(tool_response, dict):
         agent_id = tool_response.get("agentId")
+        if agent_id:
+            # Join key for subagent-stop-audit.py: a background worker's
+            # launch row carries no usage, its SubagentStop row carries it.
+            record["agent_id"] = agent_id
         record["agent_type"] = tool_response.get("agentType") or subagent_type
         if tool_response.get("totalTokens") is not None:
             record["total_tokens"] = tool_response.get("totalTokens")

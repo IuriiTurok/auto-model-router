@@ -30,7 +30,7 @@ When invoked:
 4. Show the user:
    - `tier`, `model`, `effort`, `confidence`, `band`, `source`,
      `reason`
-   - The suggested action (auto-delegate / ask / silent).
+   - The suggested action (auto-delegate / silent).
 5. If the user wants to apply the decision, dispatch via
    `Agent(subagent_type="router-<model>", prompt="<prompt>")`.
 

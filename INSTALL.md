@@ -57,37 +57,35 @@ After install, verify:
 command -v cc-route && cc-route --help
 ```
 
-## 4 — (Optional) Set ANTHROPIC_API_KEY for the Haiku fallback
+## 4 — Verify it's working
 
-Without an API key, ambiguous prompts default to "haiku at
-confidence 0.55 (ask)" — cheap-and-confirm. With a key, the router falls
-back to a Haiku classifier call (~1.5 s) for borderline cases and emits
-much sharper classifications.
-
-```bash
-echo 'export ANTHROPIC_API_KEY=sk-ant-...' >> ~/.zshrc   # or .bashrc
-```
-
-## 5 — Verify it's working
-
-In a fresh Claude Code session, send any prompt and look at the
-chat for the injected line:
+In a fresh Claude Code session on Opus, send a prompt like
+"refactor the rate limiter" and look for the injected line:
 
 ```
-[auto-router] tier=… model=… effort=… confidence=… band=… ...
+AUTO-ROUTE: Agent(subagent_type="auto-model-router:router-sonnet") per auto-model-routing skill.
 ```
 
-If you see it, the hook fired. Try `/route-status` to confirm the
-audit log is being written and to see the rolling distribution.
+If you see it, the hook fired. Silence is normal for prompts that would run on
+the same model as the session, short follow-ups, and lookups. Try
+`/route-status` to confirm the audit log is being written and to see the
+rolling distribution.
 
-## 6 — (Optional) Per-project overrides
+## 5 — (Optional) Per-project overrides
 
 Drop a `.claude/router.json` at any project root to pin behaviour.
 Example for a design/asset project:
 
 ```json
 {
-  "default_model": "sonnet"
+  "rules": [
+    {
+      "match": "logo|mascot|asset",
+      "regex": true,
+      "model": "sonnet",
+      "reason": "design/asset work — Sonnet is plenty"
+    }
+  ]
 }
 ```
 
@@ -95,17 +93,20 @@ Example for a CAD / firmware / hard-engineering project:
 
 ```json
 {
-  "default_model": "opus",
   "rules": [
     {
       "match": "list|status|find",
       "regex": true,
       "model": "haiku",
-      "reason": "trivial lookups still don't need opus"
+      "reason": "lookups don't need opus"
     }
   ]
 }
 ```
+
+A rule routes only when its model is strictly cheaper than the session's own
+(use `#model=` in a prompt to route up). `default_model` is audited but never
+injected.
 
 The hook walks up from your `cwd` looking for the first
 `.claude/router.json`. See README for the full schema.
@@ -114,7 +115,7 @@ The hook walks up from your `cwd` looking for the first
 
 > **Mutually exclusive with steps 1–2 above.** Apply this _only_ if you cloned the
 > repo directly and never ran `/plugin install`. Running both wiring paths at once
-> fires all three hooks twice per event and loads every skill, agent, and command
+> fires all five hooks twice per event and loads every skill, agent, and command
 > twice (once namespaced `auto-model-router:*`, once bare). If you are migrating
 > from a manual install to the marketplace install, remove these hook entries and
 > symlinks first.
@@ -123,7 +124,7 @@ If you wire the plugin by hand instead of via the marketplace (e.g. you
 cloned the repo straight into `~/.claude/plugins/auto-model-router/`), you
 must replicate everything the marketplace would auto-load. **`hooks/hooks.json`
 is the source of truth — mirror ALL of it, not just the first hook.** As of
-v0.3.0 that means **three** hooks (unchanged in v0.5.0):
+v0.9.0 that means **five** hooks:
 
 ```jsonc
 // ~/.claude/settings.json → "hooks"
@@ -141,12 +142,24 @@ v0.3.0 that means **three** hooks (unchanged in v0.5.0):
   { "matcher": "Agent", "hooks": [{ "type": "command",
     "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/post-agent-audit.py",
     "timeout": 3 }] }
+],
+"SubagentStop": [
+  { "hooks": [{ "type": "command",
+    "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/subagent-stop-audit.py",
+    "timeout": 5 }] }
+],
+"Stop": [
+  { "hooks": [{ "type": "command",
+    "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/reconcile-outcomes.py",
+    "timeout": 5 }] }
 ]
 ```
 
 Miss the `PreToolUse[Agent]` entry and the classifier still works, but
 `wall_ms` is never captured — so the parallelism / time-to-results numbers in
-`/router-report` stay empty.
+`/router-report` stay empty. Miss `SubagentStop` and a background worker's
+usage is never recorded (its launch row has none), so realized spend is
+undercounted.
 
 Then symlink the skills, subagents, and **all** commands into `~/.claude/`:
 
@@ -156,7 +169,7 @@ ln -sf ~/.claude/plugins/auto-model-router/skills/plan-with-models     ~/.claude
 for m in haiku sonnet opus fable; do
   ln -sf ~/.claude/plugins/auto-model-router/agents/router-$m.md ~/.claude/agents/router-$m.md
 done
-for c in route route-status router-report router-loop; do
+for c in route route-status router-report; do
   ln -sf ~/.claude/plugins/auto-model-router/commands/$c.md ~/.claude/commands/$c.md
 done
 ```
@@ -180,9 +193,8 @@ If you installed the CLI wrapper:
 rm ~/.local/bin/cc-route
 ```
 
-The audit log and classification cache live at
-`~/.claude/cache/router/`. Delete that directory if you want a clean
-slate.
+The audit log lives at `~/.claude/cache/router/`. Delete that directory if you
+want a clean slate.
 
 ## Troubleshooting
 
@@ -190,8 +202,9 @@ slate.
 Check `~/.claude/settings.json` — under `hooks` there should be either
 marketplace-registered entries (no manual edit needed) or, if you
 installed manually, command entries pointing at the plugin path. There
-are **three** hooks (UserPromptSubmit + PreToolUse[Agent] +
-PostToolUse[Agent]) — see "Manual / non-marketplace install" above.
+are **five** hooks (UserPromptSubmit + PreToolUse[Agent] +
+PostToolUse[Agent] + SubagentStop + Stop) — see "Manual / non-marketplace
+install" above.
 Settings.json hook edits take effect in new sessions (or after opening
 `/hooks` once), not mid-session.
 
