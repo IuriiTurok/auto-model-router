@@ -5,7 +5,8 @@ Reads the router audit log (~/.claude/cache/router/audit.jsonl) and Claude Code
 session transcripts (~/.claude/projects/**), and reports:
 
   - descriptive: models used, % of tokens by model, band, share
-  - GOAL 1 cost efficiency:  estimated $ saved vs all-Opus
+  - GOAL 1 cost efficiency:  estimated $ saved vs running the same tokens on the
+                             parent session's model
   - GOAL 2 quality:          user-correction rate, router vs inline cohort
   - GOAL 3 time-to-results:  session duration, time-to-first-approval, parallelism
 
@@ -32,7 +33,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hooks"))
-from pricing import PRICES, cost_usd, counterfactual_saving, model_family  # noqa: E402
+from pricing import PRICES, cost_usd, model_family, saving_vs_parent  # noqa: E402
 
 CACHE_DIR = os.path.expanduser(
     os.environ.get("CC_ROUTER_CACHE_DIR", "~/.claude/cache/router")
@@ -161,17 +162,46 @@ def assistant_router_dispatch(rec: dict) -> bool:
 
 
 def usage_of(rec: dict):
-    """-> (family, tokens_in, tokens_out) or None for an assistant record."""
+    """-> {id, model, in, out, cache_read, cache_write} for an assistant record
+    that carries usage, else None. `id` is the API response's message.id: a
+    response is written once per content block, every record repeating the
+    same usage, so callers must fold records by id rather than sum them."""
     if rec.get("type") != "assistant":
         return None
     msg = rec.get("message") or {}
     usage = msg.get("usage") or {}
-    fam = model_family(msg.get("model") or rec.get("model"))
-    tin = usage.get("input_tokens") or 0
-    tout = usage.get("output_tokens") or 0
+    tin = int(usage.get("input_tokens") or 0)
+    tout = int(usage.get("output_tokens") or 0)
     if not (tin or tout):
         return None
-    return fam, int(tin), int(tout)
+    return {
+        "id": msg.get("id"),
+        "model": msg.get("model") or rec.get("model"),
+        "in": tin,
+        "out": tout,
+        "cache_read": int(usage.get("cache_read_input_tokens") or 0),
+        "cache_write": int(usage.get("cache_creation_input_tokens") or 0),
+    }
+
+
+def owner_transcript(path: str) -> str:
+    """The top-level transcript a file's tokens belong to: the file itself, or
+    for a subagent file (<session>/subagents/agent-*.jsonl) its parent
+    session's <session>.jsonl."""
+    marker = f"{os.sep}subagents{os.sep}"
+    if marker not in path:
+        return path
+    return path.split(marker)[0] + ".jsonl"
+
+
+_ROTATED_AUDIT = re.compile(r"\.\d{8}T\d{6}Z$")
+
+
+def audit_paths(path: str = AUDIT_LOG) -> list[str]:
+    """The live audit log plus its rotated files (audit.jsonl.<stamp>), oldest
+    first, so a 30/90-day window is not truncated at the last rotation."""
+    rotated = sorted(p for p in glob.glob(f"{path}.*") if _ROTATED_AUDIT.search(p))
+    return rotated + [path]
 
 
 def _median(xs):
@@ -179,6 +209,42 @@ def _median(xs):
 
 
 # ── Core analysis ───────────────────────────────────────────────────────────
+def _aggregate_tokens(msgs: dict) -> tuple[dict, dict]:
+    """Roll per-response usage up into (tokens by family, subagent usage by
+    (worker model, parent model)).
+
+    The parent of a subagent's tokens is its owning session's dominant model
+    (by in+out tokens); when that session is not in the window, the window's
+    dominant top-level model stands in. Top-level tokens ARE the parent's own,
+    so they carry no saving.
+    """
+    tokens = defaultdict(lambda: {"in": 0, "out": 0})
+    top_models = defaultdict(Counter)  # owner transcript -> model -> in+out
+    for m in msgs.values():
+        fam = model_family(m["model"]) or "other"
+        tokens[fam]["in"] += m["in"]
+        tokens[fam]["out"] += m["out"]
+        if not m["sub"]:
+            top_models[m["owner"]][m["model"]] += m["in"] + m["out"]
+    window_models = Counter()
+    for counter in top_models.values():
+        window_models.update(counter)
+    fallback = window_models.most_common(1)[0][0] if window_models else None
+
+    delegated = defaultdict(
+        lambda: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0}
+    )
+    for m in msgs.values():
+        if not m["sub"]:
+            continue
+        owned = top_models.get(m["owner"])
+        parent = owned.most_common(1)[0][0] if owned else fallback
+        bucket = delegated[(m["model"], parent)]
+        for field in ("in", "out", "cache_read", "cache_write"):
+            bucket[field] += m[field]
+    return {k: dict(v) for k, v in tokens.items()}, dict(delegated)
+
+
 def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -> dict:
     """Walk transcripts in the window; return the full KPI dict.
 
@@ -191,7 +257,8 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -
     cutoff = end_dt - timedelta(days=days)
     cutoff_epoch = cutoff.timestamp()
 
-    tokens = defaultdict(lambda: {"in": 0, "out": 0})  # family -> tokens
+    msgs = {}  # message.id -> folded usage; one API response = one entry
+    anon = 0  # records without an id each stand alone
     cohort = {  # router-delegated vs inline
         "router": Counter(),  # correction/approval/neutral counts
         "inline": Counter(),
@@ -225,17 +292,27 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -
         except OSError:
             continue
 
-        # Token totals: fold every in-window assistant usage (incl. subagents).
+        # Token totals: fold every in-window assistant usage (incl. subagents),
+        # once per API response — each content block of a response is its own
+        # record repeating the same usage (a 2.8x overcount when summed
+        # per record). Output grows while streaming, so keep the max per field.
         for rec in records:
             ts = parse_ts(rec.get("timestamp"))
             if ts is not None and (ts < cutoff or ts > end_dt):
                 continue
             u = usage_of(rec)
-            if u:
-                fam, tin, tout = u
-                key = fam or "other"
-                tokens[key]["in"] += tin
-                tokens[key]["out"] += tout
+            if not u:
+                continue
+            key = u["id"]
+            if not key:
+                anon += 1
+                key = f"_{anon}"
+            cur = msgs.get(key)
+            if cur is None:
+                msgs[key] = {**u, "sub": is_subagent, "owner": owner_transcript(path)}
+            else:
+                for field in ("in", "out", "cache_read", "cache_write"):
+                    cur[field] = max(cur[field], u[field])
 
         if is_subagent:
             continue  # session-level metrics only from top-level transcripts
@@ -282,11 +359,13 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -
             if first_approval_ts:
                 ttfa.append((first_approval_ts - first_ts).total_seconds())
 
+    tokens, delegated = _aggregate_tokens(msgs)
     return {
         "window_days": days,
         "sessions_scanned": sessions_scanned,
         "files_in_window": len(files),
-        "tokens": {k: dict(v) for k, v in tokens.items()},
+        "tokens": tokens,
+        "delegated": delegated,
         "cohort": {k: dict(v) for k, v in cohort.items()},
         "durations_s": durations,
         "ttfa_s": ttfa,
@@ -340,15 +419,16 @@ def _normalize_usage_keys(usage: dict) -> dict:
     }
 
 
-def _realized_add(bucket: dict, totals: dict, kind: str, model_actual, usage) -> None:
+def _realized_add(bucket: dict, totals: dict, kind: str, model_actual, usage) -> bool:
     """Accumulate one dispatch/inline row's real usage into `bucket` (keyed
-    "<kind>/<family>") and `totals` ({"cost": .., "opus_cost": ..})."""
+    "<kind>/<family>") and `totals` ({"cost": .., "opus_cost": ..}). Returns
+    whether the row carried any usage."""
     if not usage:
-        return
+        return False
     norm = _normalize_usage_keys(usage)
     tok = sum(norm.values())
     if not tok:
-        return
+        return False
     cost = cost_usd(model_actual, norm)
     fam = model_family(model_actual) or "other"
     key = f"{kind}/{fam}"
@@ -358,14 +438,15 @@ def _realized_add(bucket: dict, totals: dict, kind: str, model_actual, usage) ->
     totals["cost"] += cost
     if fam in ("opus", "fable"):
         totals["opus_cost"] += cost
+    return True
 
 
 def analyze_audit(days: int, end=None) -> dict:
     """Band/source/model distribution + parallelism from the router's own log,
     plus the "Realized" rollup — actual $ spent (by kind x model_actual family),
     dispatch follow-through, escalation rate, and median live-context size —
-    computed from the audit rows' real usage rather than the all-Opus
-    counterfactual in cost_kpi().
+    computed from the audit rows' real usage rather than the vs-parent
+    counterfactual in cost_kpi(). Reads the rotated audit files too.
 
     Reuses analyze-audit.py::find_parallel_batches via importlib (the module
     filename is hyphenated, so it can't be a normal import).
@@ -377,14 +458,19 @@ def analyze_audit(days: int, end=None) -> dict:
 
     out = {"decisions": 0, "by_band": {}, "by_model": {}, "parallel": {}}
     rows = []
-    try:
-        with open(AUDIT_LOG, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    rows.append(json.loads(line))
-                except (json.JSONDecodeError, ValueError):
-                    continue
-    except OSError:
+    opened = False
+    for audit_path in audit_paths(AUDIT_LOG):
+        try:
+            with open(audit_path, encoding="utf-8", errors="replace") as f:
+                opened = True
+                for line in f:
+                    try:
+                        rows.append(json.loads(line))
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+        except OSError:
+            continue
+    if not opened:
         return out
 
     end_dt = end or datetime.now(timezone.utc)
@@ -397,10 +483,15 @@ def analyze_audit(days: int, end=None) -> dict:
     dispatched = 0
     escalations = 0
     dispatch_ids = set()
-    cheaper_decisions = []  # (decision_id, model, parent) where model < parent rank
+    # decision_ids of auto-band decisions routed to a model cheaper than the
+    # parent's. Band-none rows (the haiku fallback, project_default_inline) can
+    # never be injected, so they are not follow-through candidates.
+    cheaper_decisions = []
     realized_bucket = {}
     realized_totals = {"cost": 0.0, "opus_cost": 0.0}
     ctx_tokens = []
+    worker_rows = {}  # agent_id -> worker_usage row (subagent-stop-audit.py)
+    agents_with_usage = set()  # agent_ids whose dispatch row already has usage
 
     for r in rows:
         ts = parse_ts(r.get("ts"))
@@ -416,7 +507,12 @@ def analyze_audit(days: int, end=None) -> dict:
             out["decisions"] += 1
             did = d.get("decision_id")
             model, parent = d.get("model"), d.get("parent")
-            if did and model in _FAMILY_RANK and parent in _FAMILY_RANK:
+            if (
+                did
+                and band == "auto"
+                and model in _FAMILY_RANK
+                and parent in _FAMILY_RANK
+            ):
                 if _FAMILY_RANK[model] < _FAMILY_RANK[parent]:
                     cheaper_decisions.append(did)
             if band == "auto" and did:
@@ -435,13 +531,17 @@ def analyze_audit(days: int, end=None) -> dict:
             did = r.get("decision_id")
             if did:
                 dispatch_ids.add(did)
-            _realized_add(
+            if _realized_add(
                 realized_bucket,
                 realized_totals,
                 r.get("kind") or "router",
                 r.get("model_actual"),
                 r.get("usage"),
-            )
+            ) and r.get("agent_id"):
+                agents_with_usage.add(r["agent_id"])
+        elif oc == "worker_usage":
+            if r.get("agent_id"):
+                worker_rows[r["agent_id"]] = r
         elif oc == "native_dispatch":
             did = r.get("decision_id")
             if did:
@@ -468,6 +568,19 @@ def analyze_audit(days: int, end=None) -> dict:
                 )
                 if usage.get("context_tokens") is not None:
                     ctx_tokens.append(usage["context_tokens"])
+
+    # A background worker's launch row carries no usage; its SubagentStop row
+    # does. A foreground worker has both — count its usage once, from the row
+    # that came with the dispatch.
+    for agent_id, r in worker_rows.items():
+        if agent_id not in agents_with_usage:
+            _realized_add(
+                realized_bucket,
+                realized_totals,
+                r.get("kind") or "router",
+                r.get("model_actual"),
+                r.get("usage"),
+            )
 
     out["by_band"] = dict(by_band)
     out["by_model"] = dict(by_model)
@@ -525,20 +638,33 @@ def analyze_audit(days: int, end=None) -> dict:
 
 
 # ── KPI rollups ─────────────────────────────────────────────────────────────
-def cost_kpi(tokens: dict) -> dict:
+def cost_kpi(tokens: dict, delegated: dict) -> dict:
+    """`tokens`: family -> uncached {in, out}. `delegated`: (worker model,
+    parent model) -> subagent usage incl. cache. The saving is what that usage
+    would have cost on the PARENT session's model, minus what it cost on the
+    worker's model."""
     total_in = sum(v["in"] for v in tokens.values())
     total_out = sum(v["out"] for v in tokens.values())
     total_tok = total_in + total_out
-    offload = 0.0  # savings from families cheaper than baseline (Haiku/Sonnet)
-    premium = 0.0  # extra spend from pricier-than-baseline families (Fable) — not router-attributable
+    offload = 0.0  # workers cheaper than their parent session's model
+    premium = 0.0  # workers dearer than their parent (e.g. #model=fable under Opus)
+    for (model, parent), u in delegated.items():
+        delta = saving_vs_parent(
+            model,
+            parent,
+            {
+                "tokens_in": u["in"],
+                "tokens_out": u["out"],
+                "cache_read": u["cache_read"],
+                "cache_write": u["cache_write"],
+            },
+        )
+        if delta >= 0:
+            offload += delta
+        else:
+            premium += delta
     by_model_pct = {}
     for fam, v in tokens.items():
-        if fam in PRICES:
-            delta = counterfactual_saving(fam, v["in"], v["out"])
-            if delta >= 0:
-                offload += delta
-            else:
-                premium += delta
         share = (v["in"] + v["out"]) / total_tok if total_tok else 0.0
         by_model_pct[fam] = round(100 * share, 1)
     return {
@@ -546,8 +672,8 @@ def cost_kpi(tokens: dict) -> dict:
         "tokens_out": total_out,
         "pct_tokens_by_model": by_model_pct,
         "est_offload_saved_usd": round(offload, 2),
-        "parent_model_premium_usd": round(premium, 2),
-        "est_saved_vs_opus_usd": round(offload + premium, 2),
+        "worker_premium_usd": round(premium, 2),
+        "est_saved_vs_parent_usd": round(offload + premium, 2),
     }
 
 
@@ -585,7 +711,7 @@ def build_report(data: dict) -> dict:
     return {
         "window_days": data["window_days"],
         "sessions_scanned": data["sessions_scanned"],
-        "cost": cost_kpi(data["tokens"]),
+        "cost": cost_kpi(data["tokens"], data["delegated"]),
         "quality": quality_kpi(data["cohort"]),
         "time": time_kpi(data["durations_s"], data["ttfa_s"]),
         "router_activity": data["audit"],
@@ -613,7 +739,7 @@ def render_markdown(
         f"date: {today}",
         f"window_days: {rep['window_days']}",
         "kind: router-usage-report",
-        f"est_saved_usd: {c['est_saved_vs_opus_usd']}",
+        f"est_saved_usd: {c['est_saved_vs_parent_usd']}",
         "---",
         "",
         f"# Router Usage Report — last {rep['window_days']}d",
@@ -634,14 +760,15 @@ def render_markdown(
         "",
         "## GOAL 1 — Cost efficiency",
         "",
-        f"- **Cheaper-model offload saved: ${c['est_offload_saved_usd']}** "
-        "(Haiku/Sonnet tokens vs the all-Opus baseline — the router-attributable win)",
-        f"- **Parent-model premium: ${c['parent_model_premium_usd']}** "
-        "(Fable parent-session tokens cost >Opus — a session-model choice, not routing)",
-        f"- Net vs all-Opus: ${c['est_saved_vs_opus_usd']} (offload + premium; "
-        "counterfactual estimate, mostly output tokens — see note)",
+        f"- **Cheaper-worker offload saved: ${c['est_offload_saved_usd']}** "
+        "(subagent usage incl. cache, priced at the parent session's model minus "
+        "the worker's model — the router-attributable win)",
+        f"- **Dearer-worker premium: ${c['worker_premium_usd']}** "
+        "(workers pricier than their parent, e.g. #model=fable under an Opus parent)",
+        f"- Net vs parent: ${c['est_saved_vs_parent_usd']} (offload + premium; "
+        "counterfactual estimate at list prices)",
         f"- Uncached input: {c['tokens_in']:,} · output: {c['tokens_out']:,} "
-        "(cache-read/creation tokens excluded; with prompt caching most input "
+        "(cache-read/creation tokens excluded here; with prompt caching most input "
         "is cached, so uncached input is small by design)",
         "- % below is share of (uncached-input + output) tokens by model — the "
         "parent session model dominates; the cheaper-model share is the routed slice.",
@@ -654,10 +781,11 @@ def render_markdown(
         f"  - skip outcomes, drifted spellings folded into inline_other: "
         f"{rc.get('skip_outcomes', {})}",
         "",
-        "## Realized — actual $ from audit-row usage (not the all-Opus counterfactual)",
+        "## Realized — actual $ from audit-row usage (not the vs-parent counterfactual)",
         "",
         f"- Total realized spend: ${r.get('total_cost_usd', 0)} "
-        "(router/native dispatch rows + inline-unattributed usage, real tokens x real price)",
+        "(router/native dispatch rows + finished background workers + "
+        "inline-unattributed usage, real tokens x real price)",
         f"- Opus-class (opus + fable) cost share: {r.get('opus_class_cost_pct')}%",
         f"- Dispatch follow-through: {r.get('dispatch_follow_through_pct')}% "
         "(of decisions routed to a strictly cheaper model than the parent, the "
@@ -708,9 +836,9 @@ def render_markdown(
             "",
             f"- Router decisions: {a['decisions']} vs {pa['decisions']} "
             f"({_fmt_delta(a['decisions'], pa['decisions'])})",
-            f"- Net vs all-Opus: ${c['est_saved_vs_opus_usd']} vs "
-            f"${pc['est_saved_vs_opus_usd']} "
-            f"({_fmt_delta(c['est_saved_vs_opus_usd'], pc['est_saved_vs_opus_usd'])})",
+            f"- Net vs parent: ${c['est_saved_vs_parent_usd']} vs "
+            f"${pc['est_saved_vs_parent_usd']} "
+            f"({_fmt_delta(c['est_saved_vs_parent_usd'], pc['est_saved_vs_parent_usd'])})",
             f"- Realized total spend: ${r.get('total_cost_usd', 0)} vs "
             f"${pr.get('total_cost_usd', 0)} "
             f"({_fmt_delta(r.get('total_cost_usd'), pr.get('total_cost_usd'))})",
@@ -803,9 +931,7 @@ def main() -> int:
     compare = None
     if args.compare_days:
         prior_end = now - timedelta(days=days)
-        compare = build_report(
-            analyze(args.compare_days, judge=judge, end=prior_end)
-        )
+        compare = build_report(analyze(args.compare_days, judge=judge, end=prior_end))
 
     if args.json:
         out = dict(rep)

@@ -13,22 +13,26 @@ parallel → synthesize.**
 ## 1. Cost efficiency — *spend less per result*
 
 **Goal:** route work to the cheapest model that can do it well; don't burn
-Opus rates on Haiku-tier work.
+the session model's rate on work a cheaper model can do.
 
-**Primary metric — estimated $ saved vs all-Opus.**
-For every token that ran on a cheaper model (Haiku/Sonnet), the saving is
-`tokens × (Opus_rate − actual_rate)`, summed over the window. It is an
-**estimate** of a counterfactual (what the same work would have cost on Opus),
-not a billed number.
+**Primary metric — estimated $ saved vs the parent session's model.**
+For every sub-agent token (cache included) that ran on a model cheaper than the
+session that spawned it, the saving is
+`usage priced at the parent's model − usage priced at the worker's model`,
+summed over the window. It is an **estimate** of a counterfactual (what the
+same work would have cost on the parent's model), not a billed number. A worker
+dearer than its parent (e.g. `#model=fable` under an Opus session) shows up as
+a negative premium.
 
-**Supporting metrics:** % of tokens by model (Haiku share ↑ is the signal the
-router is working); wall-clock saved by parallelism.
+**Supporting metrics:** % of tokens by model; wall-clock saved by parallelism.
 
-**Target direction:** ↑ $ saved; Haiku share recovering toward ~15-20% (it had
-collapsed to 3.7% pre-round-1).
+**Target direction:** ↑ $ saved without a rise in the correction rate (§2).
 
-Prices (per MTok, approx): Opus $5 in / $25 out · Sonnet $3 / $15 ·
-Haiku $1 / $5.
+Prices (per MTok, list): Opus 5.5 $4 in / $20 out · Sonnet 5.5 $2 / $10 ·
+Haiku 5.5 $0.10 / $0.50 · Fable 5.1 $10 / $50 (2.5x Opus). Cache reads are 5% of
+input on Opus/Sonnet 5.5, 10% on Haiku 5.5, 2.5% on Fable 5.1; cache writes are
+2x input (1-hour TTL). Older models still served keep their own prices (see
+`hooks/pricing.py`).
 
 ---
 

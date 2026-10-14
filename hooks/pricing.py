@@ -1,31 +1,53 @@
 #!/usr/bin/env python3
 """Per-MTok price table + cost helpers, shared by the usage report.
 
-Rates are approximate (per the Anthropic models/pricing docs, 5.x era —
-Fable 5 / Opus 5 / Sonnet 5 / Haiku 4.5). Always label downstream numbers
-as estimates.
+Rates are list prices for the 5.x lineup (Opus 5.5 / Sonnet 5.5 / Haiku 5.5 /
+Fable 5.1). Always label downstream numbers as estimates.
 
-Cache pricing follows Anthropic's published multipliers off the base input
-rate: cache reads are 0.1x input, cache writes (5-minute ephemeral cache
-creation) are 1.25x input.
+An alias (`opus`, `sonnet`, `haiku`, `fable`) is priced as the CURRENT model of
+that family. A full model id is priced as that exact model when it is one of
+the older models still served (LEGACY_PRICES), and as the family's current
+model otherwise.
+
+Cache pricing differs per model: cache reads are a per-model fraction of the
+input rate, and cache writes are 2x input (observed writes use the 1-hour TTL).
 """
 
-CACHE_READ_MULT = 0.1
-CACHE_WRITE_MULT = 1.25
+import re
 
-# USD per token (published per-MTok rate / 1_000_000).
+CACHE_WRITE_MULT = 2.0
+
+
+def _rates(price_in: float, price_out: float, cache_read_mult: float) -> dict:
+    """USD per token from a per-MTok list price."""
+    return {
+        "in": price_in / 1e6,
+        "out": price_out / 1e6,
+        "cache_read": price_in * cache_read_mult / 1e6,
+        "cache_write": price_in * CACHE_WRITE_MULT / 1e6,
+    }
+
+
+# Current lineup, keyed by the alias the worker agents use (`model: opus`).
 PRICES = {
-    "fable": {"in": 10.0 / 1e6, "out": 50.0 / 1e6},
-    "opus": {"in": 5.0 / 1e6, "out": 25.0 / 1e6},
-    "sonnet": {"in": 3.0 / 1e6, "out": 15.0 / 1e6},
-    "haiku": {"in": 1.0 / 1e6, "out": 5.0 / 1e6},
+    "fable": _rates(10.0, 50.0, 0.025),  # Fable 5.1
+    "opus": _rates(4.0, 20.0, 0.05),  # Opus 5.5
+    "sonnet": _rates(2.0, 10.0, 0.05),  # Sonnet 5.5
+    "haiku": _rates(0.10, 0.50, 0.10),  # Haiku 5.5
 }
-for _p in PRICES.values():
-    _p["cache_read"] = _p["in"] * CACHE_READ_MULT
-    _p["cache_write"] = _p["in"] * CACHE_WRITE_MULT
-del _p
 
-BASELINE = "opus"  # the all-Opus counterfactual baseline
+# Older models that are still served and keep their own prices, keyed by
+# (family, "major.minor" or "major").
+LEGACY_PRICES = {
+    ("opus", "5"): _rates(5.0, 25.0, 0.10),
+    ("opus", "4.8"): _rates(5.0, 25.0, 0.10),
+    ("sonnet", "5"): _rates(2.0, 10.0, 0.10),
+    ("haiku", "4.5"): _rates(1.0, 5.0, 0.10),
+}
+
+# claude-<family>-<major>[-<minor>][-<yyyymmdd>]. The minor is 1-2 digits, so an
+# 8-digit date suffix is never mistaken for one.
+_MODEL_ID = re.compile(r"claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2})(?!\d))?")
 
 
 def model_family(model_id: str | None) -> str | None:
@@ -48,30 +70,38 @@ def model_family(model_id: str | None) -> str | None:
     return None
 
 
-def cost(family: str, tokens_in: int, tokens_out: int) -> float:
-    p = PRICES.get(family)
-    if not p:
-        return 0.0
-    return tokens_in * p["in"] + tokens_out * p["out"]
+def price_for(model: str | None) -> dict | None:
+    """Price table for an alias or a full model id; None when unknown."""
+    if not model:
+        return None
+    if model in PRICES:
+        return PRICES[model]
+    family = model_family(model)
+    if family is None:
+        return None
+    m = _MODEL_ID.search(model.lower())
+    if m:
+        version = m.group(2) + (f".{m.group(3)}" if m.group(3) else "")
+        legacy = LEGACY_PRICES.get((m.group(1), version))
+        if legacy:
+            return legacy
+    return PRICES[family]
 
 
 def cost_usd(model: str | None, usage: dict) -> float:
-    """$ cost of a usage dict against a model id or family name.
+    """$ cost of a usage dict against a model id or family alias.
 
     `usage` accepts either snake_case Anthropic API keys (input_tokens,
     output_tokens, cache_read_input_tokens, cache_creation_input_tokens)
     or the audit-log short keys (tokens_in, tokens_out, cache_read,
     cache_write). Unknown model/family or empty usage -> 0.0.
     """
-    family = model_family(model) or (model if model in PRICES else None)
-    p = PRICES.get(family)
+    p = price_for(model)
     if not p or not usage:
         return 0.0
     tokens_in = usage.get("input_tokens", usage.get("tokens_in", 0)) or 0
     tokens_out = usage.get("output_tokens", usage.get("tokens_out", 0)) or 0
-    cache_read = (
-        usage.get("cache_read_input_tokens", usage.get("cache_read", 0)) or 0
-    )
+    cache_read = usage.get("cache_read_input_tokens", usage.get("cache_read", 0)) or 0
     cache_write = (
         usage.get("cache_creation_input_tokens", usage.get("cache_write", 0)) or 0
     )
@@ -83,11 +113,12 @@ def cost_usd(model: str | None, usage: dict) -> float:
     )
 
 
-def counterfactual_saving(family: str, tokens_in: int, tokens_out: int) -> float:
-    """$ saved by running these tokens on `family` instead of the baseline
-    (Opus). Zero for the baseline itself or unknown families. Note: Fable's
-    savings are legitimately negative (costs more than Opus), which is informative.
+def saving_vs_parent(model: str | None, parent: str | None, usage: dict) -> float:
+    """$ saved by running `usage` on `model` instead of on the parent session's
+    model. Negative when the worker is dearer than its parent (e.g.
+    `#model=fable` under an Opus parent), which is informative. Zero when either
+    model is unknown.
     """
-    if family == BASELINE or family not in PRICES:
+    if price_for(model) is None or price_for(parent) is None:
         return 0.0
-    return cost(BASELINE, tokens_in, tokens_out) - cost(family, tokens_in, tokens_out)
+    return cost_usd(parent, usage) - cost_usd(model, usage)

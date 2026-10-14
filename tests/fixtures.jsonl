@@ -1,9 +1,9 @@
-{"label":"trivial-question","prompt":"what time is it?","expect":{"tier":"trivial","model":"haiku","effort":"low","conf_min":0.95,"band":"auto"}}
-{"label":"trivial-lookup","prompt":"list open PRs","expect":{"tier":"trivial","model":"haiku","effort":"low","conf_min":0.90,"band":"auto"}}
-{"label":"trivial-show","prompt":"show me the git log","expect":{"tier":"trivial","model":"haiku","effort":"low","conf_min":0.90,"band":"auto"}}
-{"label":"trivial-where","prompt":"where is the config loaded?","expect":{"tier":"trivial","model":"haiku","effort":"low","conf_min":0.95,"band":"auto"}}
-{"label":"trivial-find","prompt":"find references to FooBar","expect":{"tier":"trivial","model":"haiku","effort":"low","conf_min":0.90,"band":"auto"}}
-{"label":"trivial-summarise-q","prompt":"summarise yesterday's commits?","expect":{"tier":"trivial","model":"haiku","effort":"low","conf_min":0.95,"band":"auto"}}
+{"label":"lookup-question","prompt":"what time is it?","expect":{"tier":"default","model":"haiku","effort":"low","band":"none"}}
+{"label":"lookup-list","prompt":"list open PRs","expect":{"tier":"default","model":"haiku","effort":"low","band":"none"}}
+{"label":"lookup-show","prompt":"show me the git log","expect":{"tier":"default","model":"haiku","effort":"low","band":"none"}}
+{"label":"lookup-where","prompt":"where is the config loaded?","expect":{"tier":"default","model":"haiku","effort":"low","band":"none"}}
+{"label":"lookup-find","prompt":"find references to FooBar","expect":{"tier":"default","model":"haiku","effort":"low","band":"none"}}
+{"label":"lookup-status","prompt":"status?","expect":{"tier":"default","model":"haiku","effort":"low","band":"none"}}
 {"label":"complex-short","prompt":"refactor the rate limiter","expect":{"tier":"complex","model":"sonnet","conf_min":0.0,"band":"auto"}}
 {"label":"complex-with-code","prompt":"refactor this function:\n```python\ndef foo(x):\n    if x: return 1\n    return 0\n```\nto remove the branch","expect":{"tier":"complex","model":"opus","conf_min":0.80,"band":"auto"}}
 {"label":"complex-migration","prompt":"please migrate the user table to Postgres","expect":{"tier":"complex","model":"sonnet","conf_min":0.0,"band":"auto"}}
@@ -29,3 +29,8 @@
 {"label":"ultracode-silent","prompt":"ultracode audit the entire codebase","expect":{"silent":true}}
 {"label":"followup-ack-silent","prompt":"ok now do that again","expect":{"silent":true}}
 {"label":"followup-backref-silent","prompt":"also fix the failing test","expect":{"silent":true}}
+{"label":"harness-task-notification-silent","prompt":"<task-notification>refactor the rate limiter</task-notification>","expect":{"silent":true}}
+{"label":"harness-wrapped-silent","prompt":"  \n<system-reminder>\n<task-notification>refactor the rate limiter</task-notification>","expect":{"silent":true}}
+{"label":"harness-scheduled-task-silent","prompt":"<scheduled-task name=\"nightly\">refactor the rate limiter</scheduled-task>","expect":{"silent":true}}
+{"label":"harness-system-notification-silent","prompt":"[SYSTEM NOTIFICATION] refactor the rate limiter","expect":{"silent":true}}
+{"label":"followup-with-override","prompt":"this needs #model=opus please","expect":{"tier":"override","model":"opus","effort":"high","conf_min":1.0,"band":"auto"}}

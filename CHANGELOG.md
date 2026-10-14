@@ -3,6 +3,103 @@
 All notable changes to auto-model-router. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is semver-ish.
 
+## [0.9.0] — 2026-10-14
+
+Data-driven slimming for the 5.5 lineup (main session on Opus 5.5 at medium
+effort, 600K auto-compact window). A data audit found the hook injecting mostly
+noise: ~51% of the prompts it classified were harness events, not typed prompts;
+55% of injections came from `default_model` alone and were rarely followed; none
+of 81 haiku injections was ever dispatched (43 of 73 hits were "status?"
+continuity prompts a cold worker cannot answer); and the injection averaged
+~1,042 chars per prompt. The cost accounting also had stale prices and three
+measurement bugs. This release stops the noise and fixes the accounting.
+
+### Changed
+
+- **Harness events are skipped.** A prompt starting with `<task-notification`,
+  `<scheduled-task`, or `[SYSTEM NOTIFICATION` (after whitespace or inside a
+  `<system-reminder>` wrapper) is not classified, injected, or audited.
+- **`default_model` is audited, never injected.** A pick that came only from the
+  project default (tier `project_default`) writes its decision row with
+  `band: none` and `outcome_hint: project_default_inline`, so the dashboard feed
+  keeps working, but no `AUTO-ROUTE` is emitted.
+- **Only an inline `#model=` tag may route up.** `router.json` rules used to share
+  that exemption (`source: project_config`); they now pass the same
+  strictly-cheaper-than-the-parent gate as the heuristics. A rule to a dearer
+  or equal model is audited `same_or_higher_inline` and stays silent.
+- **Short lookups stay inline.** The trivial-lookup → haiku routing is retired:
+  lookup-phrased prompts get no pick (audited as tier `default`, band `none`).
+  The `router-haiku` agent stays for explicit dispatch (`#model=haiku`, a plan
+  step, a fan-out sub-task). The silent no-match default's tier is renamed
+  `trivial` → `default`.
+- **Injection shortened.** `AUTO-ROUTE: Agent(subagent_type=…) per
+  auto-model-routing skill.` plus the unchanged `<router-decision>` block
+  (~236 chars, down from ~410 for the base case); the `[auto-router]` header
+  line (model/effort/confidence/parent/ctx, all in the block or the audit row)
+  and the repeated procedure text are gone — the skill carries the procedure.
+  The `fanout:` clause and the budget line are shorter too.
+- **Context warning `200K → 600K`** (`CC_ROUTER_CTX_WARN`) to match the
+  auto-compact window; `auto-model-routing` SKILL text updated.
+- **Pricing for the 5.5 lineup** (`hooks/pricing.py`). Aliases price as the
+  current model — Opus 5.5 $4/$20, Sonnet 5.5 $2/$10, Haiku 5.5 $0.10/$0.50,
+  Fable 5.1 $10/$50 (2.5x Opus) per MTok — with per-model cache-read rates (5%
+  of input on Opus/Sonnet 5.5, 10% Haiku 5.5, 2.5% Fable 5.1) and cache writes
+  at 2x input (1-hour TTL). Full model ids price as themselves: Opus 5 / 4.8
+  $5/$25, Sonnet 5 $2/$10, Haiku 4.5 $1/$5; an unlisted version falls back to
+  its family's current model.
+- **Savings are measured against the parent session's model**, not an all-Opus
+  baseline: a sub-agent's usage (cache included) is priced at its session's
+  dominant model minus its own. `usage-report.py --json` keys renamed:
+  `est_saved_vs_opus_usd` → `est_saved_vs_parent_usd`,
+  `parent_model_premium_usd` → `worker_premium_usd`. `GOALS.md` drops the
+  Haiku 15-20% share target.
+- **Worker agents pin `effort:`** in their frontmatter — haiku `low`, sonnet
+  `medium`, opus `high`, fable `high` — and their text now names Opus 5.5 /
+  Sonnet 5.5 / Haiku 5.5 / Fable 5.1 (Fable is 2.5x Opus; fast mode on Opus is
+  $8/$40).
+- **`cc-route` reads the decision from the audit row** of a throwaway cache
+  instead of parsing the injected block (which carries no `tier`/`confidence`/
+  `reason` and is empty for same-or-higher picks), and launches without
+  `--model` when the router has no confident pick.
+
+### Added
+
+- **`hooks/subagent-stop-audit.py` (SubagentStop).** ~90% of router workers run
+  in the background, so the PostToolUse launch row has no usage. When a
+  `router-*` worker finishes, this hook sums its transcript (deduped by
+  `message.id`) into a `worker_usage` row joined to the launch row by the new
+  `agent_id` field (and its `decision_id`). `usage-report.py` counts a worker's
+  usage once: from the dispatch row when it has one, else from this row.
+- **Rotated audit files are read.** `analyze-audit.py`, `usage-report.py`, and
+  `replay_session_pivot.py` read `audit.jsonl.<stamp>` next to the live log, so
+  30/90-day windows are no longer truncated at the last rotation.
+
+### Fixed
+
+- **Usage is summed once per API response.** One response is written once per
+  content block, each record repeating the same `usage` (a 2.8x overcount was
+  measured). `reconcile-outcomes.py` and `usage-report.py` now fold records by
+  `message.id` (max per field; records without an id stand alone).
+
+### Removed
+
+- **`auto_threshold` / `ask_threshold`.** `auto_threshold` was a no-op
+  (`band_for` took `min(effective_auto, ROUTE_FLOOR)`, so every value ≥ 0.60
+  collapsed to the route floor). Gone: the `router.json` keys, the
+  `CC_ROUTER_AUTO_THRESHOLD` / `CC_ROUTER_ASK_THRESHOLD` env vars, the opus
+  `auto_floor`, `load_loop_config()`, and the `thresholds` field on audit
+  decision rows. `CC_ROUTER_ROUTE_FLOOR` (default 0.60) is the one cutoff.
+- **`/router-loop`, `tools/router_loop.py`, `tools/replay_kpi.py`** and their
+  tests. The loop only tuned `auto_threshold` (and since 0.8.0 its proposer
+  looked for `ask`-band rows that no longer exist), and `replay_kpi.py` only
+  re-banded under candidate thresholds. Delete `~/.claude/cache/router/loop-config`
+  if you want the leftover loop-private repo gone; `signal.jsonl` (nightly
+  Bridge B) now has no reader.
+- **Stale docs for code removed in 0.8.0:** the `ask` band, the Haiku fallback
+  classifier and `ANTHROPIC_API_KEY` step, the classification-cache bullets,
+  and the manifests' "Haiku classifier … asks when ambiguous" descriptions
+  (README, INSTALL, `plugin.json`, `marketplace.json`, `route-status.md`).
+
 ## [0.8.0] — 2026-09-09
 
 Session-aware, downhill-only routing: the hook now reads the parent session's

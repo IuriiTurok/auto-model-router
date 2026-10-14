@@ -18,16 +18,18 @@ cheaper. Each such turn is split:
 `regret_real_rate` (share of cheap sessions with >=1 real opus turn) is the
 go/no-go gate: pin only projects under the threshold (design default 10%).
 
-Read-only. No behavior change. Mirrors tools/replay_kpi.py conventions.
+Read-only. No behavior change. Reads the rotated audit.jsonl.<stamp> files too.
 
 CLI:
   python3 replay_session_pivot.py [--audit PATH] [--days 30] [--candidate sonnet]
                                   [--gate 0.10] [--table]
   -> JSON {window_days, candidate, projects:{...}, total:{...}}
 """
+
 from __future__ import annotations
 
 import argparse
+import glob
 import importlib.util
 import json
 import os
@@ -64,10 +66,13 @@ def norm_usage(u: dict) -> dict:
     if not isinstance(u, dict):
         return {}
     return {
-        "input_tokens": u.get("input", u.get("input_tokens", u.get("tokens_in", 0))) or 0,
-        "output_tokens": u.get("output", u.get("output_tokens", u.get("tokens_out", 0))) or 0,
+        "input_tokens": u.get("input", u.get("input_tokens", u.get("tokens_in", 0)))
+        or 0,
+        "output_tokens": u.get("output", u.get("output_tokens", u.get("tokens_out", 0)))
+        or 0,
         "cache_read": u.get("cache_read", u.get("cache_read_input_tokens", 0)) or 0,
-        "cache_write": u.get("cache_write", u.get("cache_creation_input_tokens", 0)) or 0,
+        "cache_write": u.get("cache_write", u.get("cache_creation_input_tokens", 0))
+        or 0,
     }
 
 
@@ -97,45 +102,73 @@ def classify_opus_turn(dec: dict) -> str:
     return "real"  # unknown/other -> conservative
 
 
+_ROTATED_AUDIT = re.compile(r"\.\d{8}T\d{6}Z$")
+
+
+def _audit_lines(audit_path: str):
+    """Every line of the live audit log and its rotated files
+    (audit.jsonl.<stamp>), oldest first, so a 30-day window is not truncated at
+    the last rotation."""
+    rotated = sorted(
+        p for p in glob.glob(f"{audit_path}.*") if _ROTATED_AUDIT.search(p)
+    )
+    for path in rotated + [audit_path]:
+        try:
+            with open(path) as f:
+                yield from f
+        except OSError:
+            continue
+
+
 def analyze(audit_path: str, days: int, candidate: str, pricing) -> dict:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     dec_by_session: dict[str, list[dict]] = defaultdict(list)
     proj_by_session: dict[str, str] = {}
     usage_by_session: dict[str, list[tuple]] = defaultdict(list)
 
-    with open(audit_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
+    for line in _audit_lines(audit_path):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = row.get("ts")
+        if ts:
             try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ts = row.get("ts")
-            if ts:
-                try:
-                    if datetime.fromisoformat(ts) < cutoff:
-                        continue
-                except (ValueError, TypeError):
-                    pass
-            sid = row.get("session_id")
-            if not sid:
-                continue
-            dec = row.get("decision")
-            if isinstance(dec, dict) and "model" in dec:
-                dec_by_session[sid].append(dec)
-                proj_by_session[sid] = proj_name(dec.get("project_config"))
-            u = row.get("usage")
-            if isinstance(u, dict):
-                usage_by_session[sid].append((u.get("model"), norm_usage(u)))
+                if datetime.fromisoformat(ts) < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        sid = row.get("session_id")
+        if not sid:
+            continue
+        dec = row.get("decision")
+        if isinstance(dec, dict) and "model" in dec:
+            dec_by_session[sid].append(dec)
+            proj_by_session[sid] = proj_name(dec.get("project_config"))
+        # Only the reconcile hook's inline-turn rows: their usage dict carries
+        # its own model. Other rows with a session_id and usage (worker_usage)
+        # have no model in it, so they would add $0 to realized_usd but
+        # candidate-priced tokens to cf_usd.
+        u = row.get("usage")
+        if row.get("outcome") == "auto_inline_unattributed" and isinstance(u, dict):
+            usage_by_session[sid].append((u.get("model"), norm_usage(u)))
 
-    projects: dict[str, dict] = defaultdict(lambda: {
-        "sessions": 0, "cheap_sessions": 0,
-        "realized_usd": 0.0, "cf_usd": 0.0,
-        "regret_none": 0, "regret_benign": 0, "regret_real": 0,
-        "opus_turns_benign": 0, "opus_turns_real": 0,
-    })
+    projects: dict[str, dict] = defaultdict(
+        lambda: {
+            "sessions": 0,
+            "cheap_sessions": 0,
+            "realized_usd": 0.0,
+            "cf_usd": 0.0,
+            "regret_none": 0,
+            "regret_benign": 0,
+            "regret_real": 0,
+            "opus_turns_benign": 0,
+            "opus_turns_real": 0,
+        }
+    )
 
     for sid, decs in dec_by_session.items():
         proj = proj_by_session.get(sid, "(unknown)")
@@ -163,8 +196,13 @@ def analyze(audit_path: str, days: int, candidate: str, pricing) -> dict:
 
     wk = 7.0 / days
     out_projects = {}
-    tot = {"cheap_sessions": 0, "realized_wk": 0.0, "cf_wk": 0.0, "save_wk": 0.0,
-           "regret_real": 0}
+    tot = {
+        "cheap_sessions": 0,
+        "realized_wk": 0.0,
+        "cf_wk": 0.0,
+        "save_wk": 0.0,
+        "regret_real": 0,
+    }
     for proj, p in projects.items():
         cheap = p["cheap_sessions"]
         save_wk = (p["realized_usd"] - p["cf_usd"]) * wk
@@ -194,41 +232,61 @@ def analyze(audit_path: str, days: int, candidate: str, pricing) -> dict:
         "save_usd_per_wk": round(tot["save_wk"], 2),
         "regret_real_rate_pct": (
             round(100.0 * tot["regret_real"] / tot["cheap_sessions"], 1)
-            if tot["cheap_sessions"] else 0.0
+            if tot["cheap_sessions"]
+            else 0.0
         ),
     }
-    return {"window_days": days, "candidate": candidate,
-            "projects": out_projects, "total": total}
+    return {
+        "window_days": days,
+        "candidate": candidate,
+        "projects": out_projects,
+        "total": total,
+    }
 
 
 def render_table(result: dict, gate: float) -> str:
     lines = []
-    hdr = (f"{'project':<22}{'sess':>5}{'cheap':>6}{'reg_real%':>10}"
-           f"{'benign':>7}{'real$/wk':>10}{'cf$/wk':>9}{'save$/wk':>10}{'gate':>6}")
+    hdr = (
+        f"{'project':<22}{'sess':>5}{'cheap':>6}{'reg_real%':>10}"
+        f"{'benign':>7}{'real$/wk':>10}{'cf$/wk':>9}{'save$/wk':>10}{'gate':>6}"
+    )
     lines.append(hdr)
     lines.append("-" * len(hdr))
     gate_pct = gate * 100
-    rows = sorted(result["projects"].items(),
-                  key=lambda kv: -kv[1]["save_usd_per_wk"])
+    rows = sorted(result["projects"].items(), key=lambda kv: -kv[1]["save_usd_per_wk"])
     for proj, p in rows:
-        verdict = "PASS" if (p["cheap_sessions"] and p["regret_real_rate_pct"] <= gate_pct
-                             and p["save_usd_per_wk"] > 0) else "no"
+        verdict = (
+            "PASS"
+            if (
+                p["cheap_sessions"]
+                and p["regret_real_rate_pct"] <= gate_pct
+                and p["save_usd_per_wk"] > 0
+            )
+            else "no"
+        )
         lines.append(
             f"{proj:<22}{p['sessions']:>5}{p['cheap_sessions']:>6}"
             f"{p['regret_real_rate_pct']:>9.0f}%{p['regret_benign']:>7}"
             f"{p['realized_usd_per_wk']:>10.2f}{p['cf_usd_per_wk']:>9.2f}"
-            f"{p['save_usd_per_wk']:>10.2f}{verdict:>6}")
+            f"{p['save_usd_per_wk']:>10.2f}{verdict:>6}"
+        )
     t = result["total"]
     lines.append("-" * len(hdr))
-    lines.append(f"{'TOTAL':<22}{'':>5}{t['cheap_sessions']:>6}"
-                 f"{t['regret_real_rate_pct']:>9.0f}%{'':>7}"
-                 f"{t['realized_usd_per_wk']:>10.2f}{t['cf_usd_per_wk']:>9.2f}"
-                 f"{t['save_usd_per_wk']:>10.2f}")
-    lines.append(f"\ngate: regret_real_rate <= {gate_pct:.0f}% AND save$/wk > 0. "
-                 f"candidate tier = {result['candidate']}, window = {result['window_days']}d.")
-    lines.append("NOTE: token counts held constant (first-order, conservative). "
-                 "$ are pricing.py estimates. Regret split is audit-only "
-                 "(effort+reason); a transcript correction pass is higher fidelity.")
+    lines.append(
+        f"{'TOTAL':<22}{'':>5}{t['cheap_sessions']:>6}"
+        f"{t['regret_real_rate_pct']:>9.0f}%{'':>7}"
+        f"{t['realized_usd_per_wk']:>10.2f}{t['cf_usd_per_wk']:>9.2f}"
+        f"{t['save_usd_per_wk']:>10.2f}"
+    )
+    lines.append(
+        f"\ngate: regret_real_rate <= {gate_pct:.0f}% AND save$/wk > 0. "
+        f"candidate tier = {result['candidate']}, window = {result['window_days']}d."
+    )
+    lines.append(
+        "NOTE: token counts held constant (first-order, conservative). "
+        "$ are pricing.py estimates. Regret split is audit-only "
+        "(effort+reason); a transcript correction pass is higher fidelity."
+    )
     return "\n".join(lines)
 
 
@@ -237,8 +295,12 @@ def main(argv=None) -> int:
     ap.add_argument("--audit", default=DEFAULT_AUDIT)
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--candidate", default="sonnet")
-    ap.add_argument("--gate", type=float, default=0.10,
-                    help="regret_real_rate go/no-go threshold (fraction)")
+    ap.add_argument(
+        "--gate",
+        type=float,
+        default=0.10,
+        help="regret_real_rate go/no-go threshold (fraction)",
+    )
     ap.add_argument("--table", action="store_true", help="human-readable table")
     a = ap.parse_args(argv)
     pricing = _load(PRICING, "pricing")

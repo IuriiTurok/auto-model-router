@@ -8,6 +8,9 @@ after deploy and the deltas read off directly.
 Usage:
     python3 tools/analyze-audit.py [--audit PATH] [--overrides PATH] [--days N]
 
+Reads the rotated audit.jsonl.<stamp> files next to --audit as well, oldest
+first, so long windows are not truncated at the last rotation.
+
 Outputs (in order):
     1. Volume + recency
     2. Distributions: model, tier, effort, band, source
@@ -20,12 +23,23 @@ Outputs (in order):
 """
 
 import argparse
+import glob
 import json
 import os
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+
+_ROTATED_AUDIT = re.compile(r"\.\d{8}T\d{6}Z$")
+
+
+def audit_paths(path):
+    """The live audit log plus its rotated files (audit.jsonl.<stamp>), oldest
+    first, so a long --days window is not truncated at the last rotation."""
+    rotated = sorted(p for p in glob.glob(f"{path}.*") if _ROTATED_AUDIT.search(p))
+    return rotated + [path]
 
 
 def load_jsonl(path):
@@ -165,7 +179,7 @@ def main():
     )
     args = p.parse_args()
 
-    rows = load_jsonl(args.audit)
+    rows = [row for path in audit_paths(args.audit) for row in load_jsonl(path)]
     if args.days:
         rows = filter_recent(rows, args.days)
 

@@ -2,7 +2,8 @@
 
 Rubric criterion 9: pass/fail signal for skill behavior.
 Each case lists a synthetic input, the expected action, and the PASS/FAIL assertion.
-Run manually or via `replay_kpi.py` (offline counterfactual re-band).
+Run manually against injected-context transcripts (the hook's own gating is
+covered by `tests/test_session_state.py`).
 
 Two bands only — `auto` (an `AUTO-ROUTE` block is present) or `none` (no block,
 hook stayed silent). There is no `ask` band, no `AskUserQuestion` step, and no
@@ -19,10 +20,7 @@ decision block it should second-guess on cost grounds.
 **Input** — injected context
 
 ```
-[auto-router] sonnet/medium conf=0.88 parent=opus ctx=42k
-AUTO-ROUTE: Agent(subagent_type="auto-model-router:router-sonnet") with a
-cold-start brief (files, decisions so far); verify its result; on failure
-re-dispatch one tier up. Skip only for a single read-only call.
+AUTO-ROUTE: Agent(subagent_type="auto-model-router:router-sonnet") per auto-model-routing skill.
 <router-decision>{"decision_id":"r_eval001","model":"sonnet","effort":"medium","band":"auto","parent":"opus","ctx":42}</router-decision>
 ```
 
@@ -48,22 +46,19 @@ paraphrases the user's request rather than relaying the worker's result.
 **Input** — injected context
 
 ```
-[auto-router] haiku/low conf=0.90 parent=opus ctx=12k
-AUTO-ROUTE: Agent(subagent_type="auto-model-router:router-haiku") with a
-cold-start brief (files, decisions so far); verify its result; on failure
-re-dispatch one tier up. Skip only for a single read-only call.
+AUTO-ROUTE: Agent(subagent_type="auto-model-router:router-haiku") per auto-model-routing skill.
 <router-decision>{"decision_id":"r_eval002","model":"haiku","effort":"low","band":"auto","parent":"opus","ctx":12}</router-decision>
 ```
 
-Session is running on an Opus-class parent model; the hook classified the prompt as a
-trivial lookup and routed it to `haiku` — strictly cheaper than the parent, so the block
-was injected (the downhill-only gate).
-Prompt: "List the files changed in the last 7 days."
+Session is running on an Opus-class parent model; the user tagged the prompt `#model=haiku`
+for a bulk mechanical edit — `haiku` is strictly cheaper than the parent, so the block was
+injected (the downhill-only gate; the hook no longer auto-routes lookups to haiku).
+Prompt: "#model=haiku Add the license header to every file under src/legacy/."
 
 **Expected action**
 Branch A: dispatch to `auto-model-router:router-haiku`. The `<router-decision>` block
 carries only `decision_id`, `model`, `effort`, `band`, `parent`, `ctx` — no `tier`,
-`source`, `reason`, or `thresholds` (those stay in the hook's own audit row, not the
+`source`, `reason`, or `confidence` (those stay in the hook's own audit row, not the
 parent's context).
 
 **PASS** — `Agent(subagent_type="auto-model-router:router-haiku", ...)` is called;
@@ -89,7 +84,8 @@ Prompt: "Explain the tradeoffs in the current caching strategy."
 
 **Expected action**
 Branch C: no block means the hook decided routing buys nothing (same-or-higher tier here;
-could equally be a follow-up, an opt-out, or a sub-route-floor confidence). Parent does the
+could equally be a follow-up, a short lookup, a project default, an opt-out, or a
+sub-route-floor confidence). Parent does the
 work itself on the current session model and logs nothing by hand — the hook already
 recorded the decision.
 
