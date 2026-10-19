@@ -739,6 +739,213 @@ check(
 )
 
 
+# ── 12. Harness events are not human turns ──────────────────────────────────
+# A background worker's completion notice lands as the next "user" record
+# after its dispatch. Classified, its "failed" / "instead of" scores as a user
+# correction in the router cohort, and it eats the router flag so the user's
+# real reply is filed as inline.
+def user(text, stamp=ts):
+    return {"type": "user", "timestamp": stamp, "message": {"content": text}}
+
+
+router_dispatch = {
+    "type": "tool_use",
+    "name": "Agent",
+    "input": {"subagent_type": "auto-model-router:router-sonnet", "description": "x"},
+}
+with tempfile.TemporaryDirectory() as pdir:
+    write_jsonl(
+        os.path.join(pdir, "p", "s_harness.jsonl"),
+        [
+            user("Build the export feature"),
+            assistant("h1", OPUS_55, {"output_tokens": 10}, [router_dispatch]),
+            user(
+                "<task-notification>\n<status>completed</status>\n<summary>Worker "
+                "done: one test failed, used csv instead of xlsx</summary>\n"
+                "</task-notification>"
+            ),
+            assistant(
+                "h2", OPUS_55, {"output_tokens": 10}, [{"type": "text", "text": "done"}]
+            ),
+            user("perfect, thanks"),
+            user("<ci-monitor-event>CI failed on the PR</ci-monitor-event>"),
+        ],
+    )
+    write_jsonl(
+        os.path.join(pdir, "p", "s_scheduled.jsonl"),
+        [
+            user('<scheduled-task name="nightly">run the digest</scheduled-task>'),
+            assistant(
+                "h3", OPUS_55, {"output_tokens": 10}, [{"type": "text", "text": "ok"}]
+            ),
+            user("no, that's wrong, revert it"),
+        ],
+    )
+    cohort = ur.analyze(days=7, projects_dir=pdir)["cohort"]
+    check(
+        "harness: the task-notification is skipped and keeps the router flag, "
+        "so the user's reply is the router turn",
+        cohort["router"] == {"approval": 1},
+    )
+    check(
+        "harness: the ci-monitor-event is not an inline turn; a scheduled-task "
+        "opener stands in for the initial request",
+        cohort["inline"] == {"correction": 1},
+    )
+
+
+# ── 13. Worker cost is attributed by agent type ─────────────────────────────
+# Offload from a native agent that happens to run on Sonnet is not the
+# router's win; the split comes from the subagent's <agent>.meta.json.
+def write_meta(path, agent_type):
+    with open(path, "w") as f:
+        json.dump({"agentType": agent_type, "description": "x"}, f)
+
+
+with tempfile.TemporaryDirectory() as pdir:
+    sub = os.path.join(pdir, "p", "s_kind", "subagents")
+    write_jsonl(
+        os.path.join(pdir, "p", "s_kind.jsonl"),
+        [assistant("k0", OPUS_55, {"input_tokens": 10, "output_tokens": 10}, [])],
+    )
+    # router worker on sonnet: opus $24 - sonnet $12 = $12 saved
+    write_jsonl(
+        os.path.join(sub, "agent-r.jsonl"),
+        [
+            assistant(
+                "k1",
+                SONNET_55,
+                {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+                [],
+            )
+        ],
+    )
+    write_meta(
+        os.path.join(sub, "agent-r.meta.json"), "auto-model-router:router-sonnet"
+    )
+    # native agent on sonnet: opus $10 - sonnet $5 = $5 saved
+    write_jsonl(
+        os.path.join(sub, "agent-g.jsonl"),
+        [assistant("k2", SONNET_55, {"output_tokens": 500_000}, [])],
+    )
+    write_meta(os.path.join(sub, "agent-g.meta.json"), "general-purpose")
+    # no meta file -> other: opus $2.00 - haiku $0.05 = $1.95 saved
+    write_jsonl(
+        os.path.join(sub, "agent-n.jsonl"),
+        [assistant("k3", HAIKU_55, {"output_tokens": 100_000}, [])],
+    )
+    cost = ur.build_report(ur.analyze(days=7, projects_dir=pdir))["cost"]
+    check(
+        "agent type: router offload = 12.0, other offload = 6.95, total = 18.95",
+        cost.get("router_offload_saved_usd") == 12.0
+        and cost.get("other_offload_saved_usd") == 6.95
+        and cost["est_offload_saved_usd"] == 18.95,
+    )
+    spend = cost.get("worker_spend_by_kind_model", {})
+    check(
+        "agent type: worker spend by kind x family from the transcripts",
+        spend.get("router/sonnet") == {"tokens": 2_000_000, "cost_usd": 12.0}
+        and spend.get("other/sonnet") == {"tokens": 500_000, "cost_usd": 5.0}
+        and spend.get("other/haiku") == {"tokens": 100_000, "cost_usd": 0.05},
+    )
+
+# Audit coverage: router workers seen in transcripts vs those with a usage row
+# (a SubagentStop worker_usage row, or a foreground dispatch row with usage).
+with tempfile.TemporaryDirectory() as pdir:
+    sub = os.path.join(pdir, "p", "s_cov", "subagents")
+    write_jsonl(
+        os.path.join(pdir, "p", "s_cov.jsonl"),
+        [assistant("c0", OPUS_55, {"output_tokens": 10}, [])],
+    )
+    for agent in ("cov_bg", "cov_fg", "cov_missing"):
+        write_jsonl(
+            os.path.join(sub, f"agent-{agent}.jsonl"),
+            [assistant(f"c_{agent}", SONNET_55, {"output_tokens": 1000}, [])],
+        )
+        write_meta(
+            os.path.join(sub, f"agent-{agent}.meta.json"),
+            "auto-model-router:router-sonnet",
+        )
+    with open(ur.AUDIT_LOG, "a") as f:
+        for row in [
+            {
+                "ts": now_iso(),
+                "outcome": "worker_usage",
+                "kind": "router",
+                "agent_id": "cov_bg",
+                "model_actual": SONNET_55,
+                "usage": FG_USAGE,
+            },
+            {
+                "ts": now_iso(),
+                "outcome": "delegated",
+                "kind": "router",
+                "agent_id": "cov_fg",
+                "model": "sonnet",
+                "model_actual": SONNET_55,
+                "usage": FG_USAGE,
+            },
+        ]:
+            f.write(json.dumps(row) + "\n")
+    realized = ur.build_report(ur.analyze(days=7, projects_dir=pdir))["realized"]
+    check(
+        "coverage: 3 router workers in transcripts, 2 with a usage row",
+        realized.get("router_workers_in_transcripts") == 3
+        and realized.get("router_workers_with_usage_row") == 2,
+    )
+
+
+# ── 14. Parallelism from overlapping worker activity ────────────────────────
+# Background workers return at launch, so dispatch wall_ms (~1 s) says nothing
+# about concurrency. Overlap of worker activity segments does; a segment runs
+# from a prompt into the worker to its last record before the next prompt, so
+# a worker idling between SendMessage continuations is not "running".
+T0 = datetime.now(timezone.utc) - timedelta(days=1)
+
+
+def at(minutes):
+    return (T0 + timedelta(minutes=minutes)).isoformat()
+
+
+def worker(path, spans):
+    """spans: [(prompt_minute, last_minute), ...] — one segment per prompt."""
+    recs = []
+    for i, (start, end) in enumerate(spans):
+        recs.append(user("brief" if i == 0 else "continue", at(start)))
+        recs.append(
+            assistant(
+                f"{os.path.basename(path)}-{i}",
+                SONNET_55,
+                {"output_tokens": 1},
+                [],
+                at(end),
+            )
+        )
+    write_jsonl(path, recs)
+
+
+with tempfile.TemporaryDirectory() as pdir:
+    sub = os.path.join(pdir, "p", "s_par", "subagents")
+    write_jsonl(
+        os.path.join(pdir, "p", "s_par.jsonl"),
+        [user("go", at(0)), assistant("p0", OPUS_55, {"output_tokens": 1}, [], at(90))],
+    )
+    worker(os.path.join(sub, "agent-a.jsonl"), [(0, 10)])
+    worker(os.path.join(sub, "agent-b.jsonl"), [(5, 20)])  # overlaps a by 5 min
+    worker(os.path.join(sub, "agent-c.jsonl"), [(30, 31), (60, 61)])  # idle 31-60
+    worker(os.path.join(sub, "agent-d.jsonl"), [(40, 45)])  # inside c's idle gap
+    t = ur.build_report(ur.analyze(days=7, projects_dir=pdir))["time"]
+    check(
+        "overlap: 5.0 min saved (a/b); c's idle gap does not overlap d",
+        t.get("worker_overlap_min_saved") == 5.0,
+    )
+    check(
+        "overlap: peak 2 concurrent workers in 1 session",
+        t.get("max_concurrent_workers") == 2
+        and t.get("sessions_with_parallel_workers") == 1,
+    )
+
+
 print("---")
 print(f"PASS={PASS} FAIL={FAIL}")
 sys.exit(0 if FAIL == 0 else 1)

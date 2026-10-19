@@ -3,6 +3,30 @@
 All notable changes to auto-model-router. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versioning is semver-ish.
 
+## [Unreleased]
+
+### Fixed
+
+- **Harness events no longer count as user turns** in the correction
+  cohorts. A background worker's `<task-notification>` (and scheduled-task,
+  system, CI-monitor and side-session notices) was classified like a typed
+  message, so its "failed" / "instead of" read as a user correction, and it
+  consumed the router flag so the user's real reply was filed as inline. Over
+  2026-10-11..18 notices carried 11 of the router cohort's 14 "corrections":
+  router 32.6% vs inline 23.1% becomes 13.2% vs 17.5%.
+- **Offload savings are split by agent type.** Each subagent's
+  `<agent>.meta.json` `agentType` tags its usage `router` or `other`; the cost
+  KPI adds `router_offload_saved_usd` / `other_offload_saved_usd` and a
+  transcript-sourced `worker_spend_by_kind_model`. The realized block reports
+  usage-row coverage (`router_workers_in_transcripts` /
+  `router_workers_with_usage_row`): the audit rows missed 22 of 66 router
+  workers in that week.
+- **Parallelism is measured from overlapping worker activity**
+  (`worker_overlap_min_saved`, `max_concurrent_workers`,
+  `sessions_with_parallel_workers` in the time KPI). A background worker's
+  dispatch `wall_ms` is its launch latency, so the audit batch figure is now
+  labelled foreground-only.
+
 ## [0.9.0] — 2026-10-14
 
 Data-driven slimming for the 5.5 lineup (main session on Opus 5.5 at medium

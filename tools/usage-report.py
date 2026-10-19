@@ -135,6 +135,18 @@ def is_human_turn(rec: dict) -> bool:
     return False
 
 
+# Harness events land in a transcript as user records nobody typed: a
+# background-task completion, a scheduled-task run, a system / CI-monitor /
+# side-session notice (auto-router.py skips the first three prefixes too). A
+# completion notice carries the worker's own result text, so classifying it
+# reads its "failed" or "instead of" as a user correction.
+_HARNESS_EVENT = re.compile(
+    r"\s*(?:<system-reminder>\s*)?"
+    r"(?:<task-notification|<scheduled-task|\[SYSTEM NOTIFICATION"
+    r"|<ci-monitor-event|<side-sessions-event)"
+)
+
+
 # Bare `router-<model>` or namespaced `auto-model-router:router-<model>` (the
 # plugin-qualified form the Agent tool sees when dispatched by name) — mirrors
 # post-agent-audit.py's ROUTER_TYPE_RE.
@@ -194,6 +206,20 @@ def owner_transcript(path: str) -> str:
     return path.split(marker)[0] + ".jsonl"
 
 
+def agent_kind(path: str) -> str:
+    """'router' when a subagent transcript's sibling <agent>.meta.json names a
+    router-* agentType, else 'other' (a native agent, or no readable meta
+    file) so router savings are never over-claimed."""
+    try:
+        with open(path[: -len(".jsonl")] + ".meta.json", encoding="utf-8") as f:
+            agent_type = json.load(f).get("agentType")
+    except (OSError, ValueError, AttributeError):
+        return "other"
+    if isinstance(agent_type, str) and _ROUTER_SUBAGENT_RE.match(agent_type):
+        return "router"
+    return "other"
+
+
 _ROTATED_AUDIT = re.compile(r"\.\d{8}T\d{6}Z$")
 
 
@@ -208,10 +234,34 @@ def _median(xs):
     return round(statistics.median(xs), 1) if xs else None
 
 
+def _overlap(segments: list) -> tuple[float, int]:
+    """(seconds saved by concurrency, peak concurrency) for one session's
+    worker activity segments: their summed length minus the length of their
+    union. Segments that only touch are not concurrent."""
+    total = sum((b - a).total_seconds() for a, b in segments)
+    union, start, end = 0.0, None, None
+    for a, b in sorted(segments):
+        if end is None or a > end:
+            if end is not None:
+                union += (end - start).total_seconds()
+            start, end = a, b
+        else:
+            end = max(end, b)
+    if end is not None:
+        union += (end - start).total_seconds()
+    live = peak = 0
+    for _, step in sorted(
+        [(a, 1) for a, _ in segments] + [(b, -1) for _, b in segments]
+    ):
+        live += step
+        peak = max(peak, live)
+    return total - union, peak
+
+
 # ── Core analysis ───────────────────────────────────────────────────────────
 def _aggregate_tokens(msgs: dict) -> tuple[dict, dict]:
     """Roll per-response usage up into (tokens by family, subagent usage by
-    (worker model, parent model)).
+    (worker model, parent model, agent kind)).
 
     The parent of a subagent's tokens is its owning session's dominant model
     (by in+out tokens); when that session is not in the window, the window's
@@ -239,7 +289,7 @@ def _aggregate_tokens(msgs: dict) -> tuple[dict, dict]:
             continue
         owned = top_models.get(m["owner"])
         parent = owned.most_common(1)[0][0] if owned else fallback
-        bucket = delegated[(m["model"], parent)]
+        bucket = delegated[(m["model"], parent, m["kind"])]
         for field in ("in", "out", "cache_read", "cache_write"):
             bucket[field] += m[field]
     return {k: dict(v) for k, v in tokens.items()}, dict(delegated)
@@ -266,6 +316,8 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -
     durations = []  # seconds, per session
     ttfa = []  # time-to-first-approval, seconds
     sessions_scanned = 0
+    segments = defaultdict(list)  # owner transcript -> worker activity segments
+    router_agents = set()  # agent ids of router workers active in the window
 
     files = []
     for path in glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True):
@@ -278,6 +330,7 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -
 
     for path in files:
         is_subagent = f"{os.sep}subagents{os.sep}" in path
+        kind = agent_kind(path) if is_subagent else None
         records = []
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
@@ -309,12 +362,38 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -
                 key = f"_{anon}"
             cur = msgs.get(key)
             if cur is None:
-                msgs[key] = {**u, "sub": is_subagent, "owner": owner_transcript(path)}
+                msgs[key] = {
+                    **u,
+                    "sub": is_subagent,
+                    "owner": owner_transcript(path),
+                    "kind": kind,
+                }
             else:
                 for field in ("in", "out", "cache_read", "cache_write"):
                     cur[field] = max(cur[field], u[field])
 
         if is_subagent:
+            # GOAL 3 activity segments: one opens at each prompt into the worker
+            # (its brief, or a SendMessage continuation) and closes at its last
+            # record before the next, so a worker idling between continuations
+            # is not counted as running.
+            start = last = None
+            for rec in records:
+                ts = parse_ts(rec.get("timestamp"))
+                if ts is None or ts < cutoff or ts > end_dt:
+                    continue
+                if start is not None and is_human_turn(rec):
+                    segments[owner_transcript(path)].append((start, last))
+                    start = None
+                if start is None:
+                    start = ts
+                last = ts
+            if start is not None:
+                segments[owner_transcript(path)].append((start, last))
+                if kind == "router":
+                    router_agents.add(
+                        os.path.basename(path)[: -len(".jsonl")].removeprefix("agent-")
+                    )
             continue  # session-level metrics only from top-level transcripts
 
         # Session-level: duration, cohort corrections, time-to-approval.
@@ -340,6 +419,13 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -
                 continue
             if is_human_turn(rec):
                 text = block_text((rec.get("message") or {}).get("content"))
+                if _HARNESS_EVENT.match(text):
+                    # Never classified, and pending_router is left alone so the
+                    # user's reply to a worker's result still lands in the
+                    # router cohort. A scheduled-task opener stands in for the
+                    # initial request.
+                    seen_first_user = True
+                    continue
                 if not seen_first_user:
                     seen_first_user = True  # initial request: not a correction
                     pending_router = False
@@ -360,6 +446,12 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -
                 ttfa.append((first_approval_ts - first_ts).total_seconds())
 
     tokens, delegated = _aggregate_tokens(msgs)
+    overlap_s, peak, parallel_sessions = 0.0, 0, 0
+    for segs in segments.values():
+        saved, top = _overlap(segs)
+        overlap_s += saved
+        peak = max(peak, top)
+        parallel_sessions += saved > 0
     return {
         "window_days": days,
         "sessions_scanned": sessions_scanned,
@@ -369,7 +461,12 @@ def analyze(days: int, projects_dir: str = PROJECTS_DIR, judge=None, end=None) -
         "cohort": {k: dict(v) for k, v in cohort.items()},
         "durations_s": durations,
         "ttfa_s": ttfa,
-        "audit": analyze_audit(days, end=end_dt),
+        "worker_overlap": {
+            "saved_s": overlap_s,
+            "peak": peak,
+            "sessions": parallel_sessions,
+        },
+        "audit": analyze_audit(days, end=end_dt, router_agents=router_agents),
     }
 
 
@@ -441,7 +538,7 @@ def _realized_add(bucket: dict, totals: dict, kind: str, model_actual, usage) ->
     return True
 
 
-def analyze_audit(days: int, end=None) -> dict:
+def analyze_audit(days: int, end=None, router_agents=None) -> dict:
     """Band/source/model distribution + parallelism from the router's own log,
     plus the "Realized" rollup — actual $ spent (by kind x model_actual family),
     dispatch follow-through, escalation rate, and median live-context size —
@@ -452,7 +549,9 @@ def analyze_audit(days: int, end=None) -> dict:
     filename is hyphenated, so it can't be a normal import).
 
     `end`, if given, is the window's upper-bound datetime (default: now) — see
-    analyze()'s docstring.
+    analyze()'s docstring. `router_agents`, if given, is the set of router
+    worker agent ids seen in the window's subagent transcripts; the realized
+    block then reports how many of them have a usage row.
     """
     import importlib.util
 
@@ -614,6 +713,11 @@ def analyze_audit(days: int, end=None) -> dict:
         ),
         "median_context_tokens_per_turn": _median(ctx_tokens),
     }
+    if router_agents is not None:
+        out["realized"]["router_workers_in_transcripts"] = len(router_agents)
+        out["realized"]["router_workers_with_usage_row"] = len(
+            router_agents & (set(worker_rows) | agents_with_usage)
+        )
 
     spec_path = os.path.join(os.path.dirname(__file__), "analyze-audit.py")
     try:
@@ -640,29 +744,33 @@ def analyze_audit(days: int, end=None) -> dict:
 # ── KPI rollups ─────────────────────────────────────────────────────────────
 def cost_kpi(tokens: dict, delegated: dict) -> dict:
     """`tokens`: family -> uncached {in, out}. `delegated`: (worker model,
-    parent model) -> subagent usage incl. cache. The saving is what that usage
-    would have cost on the PARENT session's model, minus what it cost on the
-    worker's model."""
+    parent model, agent kind) -> subagent usage incl. cache. The saving is what
+    that usage would have cost on the PARENT session's model, minus what it
+    cost on the worker's model; it is split by agent kind because only the
+    router workers' share is the router's win."""
     total_in = sum(v["in"] for v in tokens.values())
     total_out = sum(v["out"] for v in tokens.values())
     total_tok = total_in + total_out
     offload = 0.0  # workers cheaper than their parent session's model
+    offload_by_kind = Counter()  # the same offload, router vs other agents
     premium = 0.0  # workers dearer than their parent (e.g. #model=fable under Opus)
-    for (model, parent), u in delegated.items():
-        delta = saving_vs_parent(
-            model,
-            parent,
-            {
-                "tokens_in": u["in"],
-                "tokens_out": u["out"],
-                "cache_read": u["cache_read"],
-                "cache_write": u["cache_write"],
-            },
-        )
+    spend = defaultdict(lambda: {"tokens": 0, "cost_usd": 0.0})  # kind/family
+    for (model, parent, kind), u in delegated.items():
+        usage = {
+            "tokens_in": u["in"],
+            "tokens_out": u["out"],
+            "cache_read": u["cache_read"],
+            "cache_write": u["cache_write"],
+        }
+        delta = saving_vs_parent(model, parent, usage)
         if delta >= 0:
             offload += delta
+            offload_by_kind[kind] += delta
         else:
             premium += delta
+        entry = spend[f"{kind}/{model_family(model) or 'other'}"]
+        entry["tokens"] += sum(usage.values())
+        entry["cost_usd"] += cost_usd(model, usage)
     by_model_pct = {}
     for fam, v in tokens.items():
         share = (v["in"] + v["out"]) / total_tok if total_tok else 0.0
@@ -672,8 +780,14 @@ def cost_kpi(tokens: dict, delegated: dict) -> dict:
         "tokens_out": total_out,
         "pct_tokens_by_model": by_model_pct,
         "est_offload_saved_usd": round(offload, 2),
+        "router_offload_saved_usd": round(offload_by_kind["router"], 2),
+        "other_offload_saved_usd": round(offload_by_kind["other"], 2),
         "worker_premium_usd": round(premium, 2),
         "est_saved_vs_parent_usd": round(offload + premium, 2),
+        "worker_spend_by_kind_model": {
+            k: {"tokens": v["tokens"], "cost_usd": round(v["cost_usd"], 4)}
+            for k, v in sorted(spend.items())
+        },
     }
 
 
@@ -696,7 +810,8 @@ def quality_kpi(cohort: dict) -> dict:
     }
 
 
-def time_kpi(durations, ttfa) -> dict:
+def time_kpi(durations, ttfa, overlap=None) -> dict:
+    overlap = overlap or {}
     return {
         "sessions": len(durations),
         "median_duration_min": round(_median(durations) / 60, 1) if durations else None,
@@ -704,6 +819,9 @@ def time_kpi(durations, ttfa) -> dict:
             round(_median(ttfa) / 60, 1) if ttfa else None
         ),
         "approvals_observed": len(ttfa),
+        "worker_overlap_min_saved": round(overlap.get("saved_s", 0) / 60, 1),
+        "max_concurrent_workers": overlap.get("peak", 0),
+        "sessions_with_parallel_workers": overlap.get("sessions", 0),
     }
 
 
@@ -713,7 +831,9 @@ def build_report(data: dict) -> dict:
         "sessions_scanned": data["sessions_scanned"],
         "cost": cost_kpi(data["tokens"], data["delegated"]),
         "quality": quality_kpi(data["cohort"]),
-        "time": time_kpi(data["durations_s"], data["ttfa_s"]),
+        "time": time_kpi(
+            data["durations_s"], data["ttfa_s"], data.get("worker_overlap")
+        ),
         "router_activity": data["audit"],
         "realized": data["audit"].get("realized", {}),
     }
@@ -761,19 +881,28 @@ def render_markdown(
         "## GOAL 1 — Cost efficiency",
         "",
         f"- **Cheaper-worker offload saved: ${c['est_offload_saved_usd']}** "
-        "(subagent usage incl. cache, priced at the parent session's model minus "
-        "the worker's model — the router-attributable win)",
+        f"(router workers ${c.get('router_offload_saved_usd', 0)} · other agents "
+        f"${c.get('other_offload_saved_usd', 0)}; subagent usage incl. cache, priced "
+        "at the parent session's model minus the worker's model — only the "
+        "router-worker share is the router's win)",
         f"- **Dearer-worker premium: ${c['worker_premium_usd']}** "
         "(workers pricier than their parent, e.g. #model=fable under an Opus parent)",
         f"- Net vs parent: ${c['est_saved_vs_parent_usd']} (offload + premium; "
         "counterfactual estimate at list prices)",
+        "- Worker spend from subagent transcripts (complete; the audit-row "
+        "figures under Realized are a lower bound):",
+    ]
+    for key, v in sorted(c.get("worker_spend_by_kind_model", {}).items()):
+        lines.append(f"    - {key:<14} {v['tokens']:>13,} tok  ${v['cost_usd']}")
+    lines += [
         f"- Uncached input: {c['tokens_in']:,} · output: {c['tokens_out']:,} "
         "(cache-read/creation tokens excluded here; with prompt caching most input "
         "is cached, so uncached input is small by design)",
         "- % below is share of (uncached-input + output) tokens by model — the "
         "parent session model dominates; the cheaper-model share is the routed slice.",
-        f"- Parallelism wall-clock saved: {a['parallel'].get('wall_ms_saved', 0)} ms "
-        f"across {a['parallel'].get('batches', 0)} batch(es)",
+        f"- Foreground dispatch batches: {a['parallel'].get('wall_ms_saved', 0)} ms "
+        f"saved across {a['parallel'].get('batches', 0)} batch(es) (audit wall_ms; a "
+        "background worker returns at launch, so real concurrency is under GOAL 3)",
         f"- Dispatch reconciliation (auto band): {rc.get('auto_decisions', 0)} decisions → "
         f"{rc.get('dispatched_total', 0)} dispatched (all bands — delegated rows carry no "
         f"decision_id, so not separable by band), {rc.get('auto_skip_logged', 0)} skip-logged, "
@@ -786,6 +915,10 @@ def render_markdown(
         f"- Total realized spend: ${r.get('total_cost_usd', 0)} "
         "(router/native dispatch rows + finished background workers + "
         "inline-unattributed usage, real tokens x real price)",
+        f"- Usage-row coverage: {r.get('router_workers_with_usage_row')} of "
+        f"{r.get('router_workers_in_transcripts')} router workers in the subagent "
+        "transcripts (a session started before the SubagentStop hook has none; a "
+        "SendMessage-continued worker's row may cover only its first run)",
         f"- Opus-class (opus + fable) cost share: {r.get('opus_class_cost_pct')}%",
         f"- Dispatch follow-through: {r.get('dispatch_follow_through_pct')}% "
         "(of decisions routed to a strictly cheaper model than the parent, the "
@@ -821,6 +954,10 @@ def render_markdown(
         f"- Median time-to-first-approval: "
         f"{t['median_time_to_first_approval_min']} min "
         f"({t['approvals_observed']} approvals observed)",
+        f"- Parallel workers: {t.get('worker_overlap_min_saved')} min saved by "
+        f"overlapping worker activity across {t.get('sessions_with_parallel_workers')} "
+        f"session(s), peak {t.get('max_concurrent_workers')} concurrent (from "
+        "subagent transcripts)",
         "",
         "_Estimates. Quality detection is heuristic unless --llm-judge was used. "
         "Router-vs-inline timing is correlation, not causation._",

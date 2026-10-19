@@ -22,7 +22,9 @@ session that spawned it, the saving is
 summed over the window. It is an **estimate** of a counterfactual (what the
 same work would have cost on the parent's model), not a billed number. A worker
 dearer than its parent (e.g. `#model=fable` under an Opus session) shows up as
-a negative premium.
+a negative premium. The report splits the saving by agent type (each
+subagent's `<agent>.meta.json`): only the router workers' share is the
+router's win.
 
 **Supporting metrics:** % of tokens by model; wall-clock saved by parallelism.
 
@@ -44,7 +46,8 @@ which the user has to correct the assistant.
 **Primary metric — user-correction rate, router vs non-router.**
 The fraction of user turns that *correct* the assistant ("no, that's wrong",
 "you shouldn't have", "revert", "that's not what I asked"), split by whether the
-preceding work was router-delegated vs done inline. **Lower is better, and the
+preceding work was router-delegated vs done inline. Harness events (task
+notifications, scheduled-task runs, system / CI notices) are not user turns. **Lower is better, and the
 router cohort must not be meaningfully worse than the inline cohort** — if it
 is, the router is trading quality for cost and the tiers need adjusting.
 
@@ -68,8 +71,10 @@ independent work in parallel.
 approval signal), with **session duration** (first user msg → last assistant
 msg) as the coarse proxy.
 
-**Supporting metric:** parallelism wall-clock saved (`Σ wall_ms − max wall_ms`
-per concurrent batch); fan-out width.
+**Supporting metric:** parallel-worker wall-clock saved (per session, the
+summed length of worker activity segments minus the length of their union,
+read from subagent transcripts; a background worker's dispatch `wall_ms` is
+only its launch); peak concurrent workers.
 
 **Target direction:** ↓ time-to-result on parallelizable tasks; fan-out
 actually firing on multi-part prompts.
