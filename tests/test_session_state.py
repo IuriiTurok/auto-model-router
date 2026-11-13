@@ -143,6 +143,89 @@ check(
     == ("opus", 0, 1),
 )
 
+
+def _assistant(model: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {"role": "assistant", "model": model, "usage": {"input_tokens": 5}},
+    }
+
+
+def _user(content: str) -> dict:
+    return {"type": "user", "message": {"role": "user", "content": content}}
+
+
+with tempfile.TemporaryDirectory() as tmp:
+
+    def _transcript(name: str, records: list[dict]) -> str:
+        path = os.path.join(tmp, name)
+        with open(path, "w") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+        return path
+
+    check(
+        "read_session_state: a Mythos id is the fable tier",
+        router.read_session_state(
+            _transcript("mythos.jsonl", [_assistant("claude-mythos-5-2")])
+        )[0]
+        == "fable",
+    )
+    check(
+        "read_session_state: no assistant record -> the caller's fallback",
+        router.read_session_state(_transcript("first.jsonl", [_user("hi")]), "fable")
+        == ("fable", 0, 1),
+    )
+    # One tool result larger than the tail window hides the assistant record
+    # from the first read; the wider read finds it.
+    check(
+        "read_session_state: an assistant record beyond the tail is still found",
+        router.read_session_state(
+            _transcript(
+                "wide.jsonl",
+                [
+                    _assistant("claude-sonnet-5-5"),
+                    _user("x" * (router.TRANSCRIPT_TAIL_BYTES + 1024)),
+                ],
+            )
+        )[0]
+        == "sonnet",
+    )
+
+# SessionStart records the model the session starts on, so the first prompt
+# (no assistant record yet) is not assumed to run on opus.
+with tempfile.TemporaryDirectory() as cache_dir:
+    started = _run(
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "s-start-fable",
+            "model": "claude-fable-5-2",
+        },
+        cache_dir,
+    )
+    check("SessionStart is silent", started.strip() == "")
+    ctx = _context(
+        _run(
+            {
+                "session_id": "s-start-fable",
+                "cwd": "/tmp",
+                "permission_mode": "default",
+                "prompt": OPUS_PROMPT,
+            },
+            cache_dir,
+        )
+    )
+    rows = _audit(cache_dir)
+    check(
+        "first prompt after a Fable SessionStart records parent=fable",
+        bool(rows) and rows[-1]["decision"]["parent"] == "fable",
+    )
+    check(
+        "opus pick on that first prompt injects (opus is cheaper than fable)",
+        ctx is not None
+        and 'Agent(subagent_type="auto-model-router:router-opus")' in ctx,
+    )
+
 # ---------------------------------------------------------------------------
 # load_project_config: project + global router.json merge
 # ---------------------------------------------------------------------------

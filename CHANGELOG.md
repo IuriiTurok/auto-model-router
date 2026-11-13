@@ -5,8 +5,29 @@ All notable changes to auto-model-router. Format loosely follows
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-11-13
+
+### Changed
+
+- **Fable is priced as Fable 5.2**: $8 / $40 per MTok, 2x Opus 5.5 (was the
+  Fable 5.1 rate, $10 / $50, 2.5x). `claude-fable-5-1` and `claude-fable-5`
+  keep their own prices as legacy models, and Mythos ids price as the Fable
+  family. The `router-fable` description, `plan-with-models` and `GOALS.md`
+  carry the new figures.
+- **A forced `#model=fable` pick records effort `high`**, matching the
+  `router-fable` agent's own frontmatter (the tier table said `xhigh`).
+
 ### Fixed
 
+- **The parent model is no longer assumed to be Opus on the first prompt.** A
+  new SessionStart hook stores the model the session starts on; the first
+  prompt has no assistant record, so until now a Fable session was audited as
+  `"parent":"opus"` and an Opus pick stayed silent. The field is optional in
+  the SessionStart payload, so the Opus default still applies without it.
+- **Mythos sessions are recognised as the Fable tier** instead of falling back
+  to Opus.
+- **An assistant record beyond the 64 KB transcript tail is still found**: when
+  one large tool result fills the tail, a single wider read (4 MB) follows.
 - **Harness events no longer count as user turns** in the correction
   cohorts. A background worker's `<task-notification>` (and scheduled-task,
   system, CI-monitor and side-session notices) was classified like a typed

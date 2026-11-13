@@ -55,6 +55,9 @@ GLOBAL_CONFIG_PATH = os.path.expanduser(
 
 # Parent-session state read off the transcript.
 TRANSCRIPT_TAIL_BYTES = 64 * 1024
+# Second, wider read for when the tail holds no assistant record (one large
+# tool result can fill the whole tail).
+TRANSCRIPT_WIDE_BYTES = 4 * 1024 * 1024
 DEFAULT_PARENT_MODEL = "opus"
 # Claude Code writes zero-usage placeholder records (API errors, "No response
 # requested.") under this model. They say nothing about the session's model.
@@ -67,7 +70,7 @@ CTX_WARN_TOKENS = int(os.environ.get("CC_ROUTER_CTX_WARN", "600000"))
 BUDGET_THROTTLE_PROMPTS = 10
 
 # Canonical model tier table. effort is the effort the router records for a
-# forced pick of that tier (the 5.5 models default to medium, Fable 5.1 to high;
+# forced pick of that tier (Sonnet 5.5 at medium; Opus 5.5 and Fable 5.2 at high;
 # the worker agents pin their own effort in their frontmatter); agent is the
 # router-<model> subagent; auto_routable is False for tiers the classifier may
 # never auto-pick (manual dispatch only).
@@ -88,7 +91,7 @@ MODEL_TIERS = {
         "auto_routable": True,
     },
     "fable": {
-        "effort": "xhigh",
+        "effort": "high",
         "agent": "router-fable",
         "auto_routable": False,
     },
@@ -98,6 +101,16 @@ MODEL_TIERS = {
 # Injection is downhill-only: a routed model whose rank is >= the parent
 # session's rank buys nothing, so the hook stays silent.
 TIER_RANK = {name: i for i, name in enumerate(MODEL_TIERS)}
+
+
+def model_tier(model: object) -> str | None:
+    """Tier (haiku/sonnet/opus/fable) for a model id or alias; None if unknown.
+
+    Mythos ids are the Fable tier: same capability class and price.
+    """
+    name = str(model or "").lower().replace("mythos", "fable")
+    return next((tier for tier in TIER_RANK if tier in name), None)
+
 
 # Audit log rotation
 AUDIT_ROTATE_BYTES = int(
@@ -111,7 +124,44 @@ AUDIT_RETAIN_DAYS = int(os.environ.get("CC_ROUTER_AUDIT_RETAIN_DAYS", "30"))
 ROUTE_FLOOR = float(os.environ.get("CC_ROUTER_ROUTE_FLOOR", "0.60"))
 
 
-def read_session_state(transcript_path: str | None) -> tuple[str, int, int]:
+def _scan_transcript(path: str, size: int, window: int) -> tuple[dict | None, int]:
+    """(last real assistant message, user-record count) in the last `window` bytes."""
+    with open(path, "rb") as f:
+        if size > window:
+            f.seek(size - window)
+            f.readline()  # discard the partial first line
+        tail = f.read().decode("utf-8", errors="replace")
+
+    turns = 0
+    last_assistant = None
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        message = rec.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = rec.get("type") or message.get("role")
+        if role == "user":
+            turns += 1
+        elif (
+            role == "assistant"
+            and message.get("model")
+            and message.get("model") != SYNTHETIC_MODEL
+        ):
+            last_assistant = message
+    return last_assistant, turns
+
+
+def read_session_state(
+    transcript_path: str | None, fallback: str = DEFAULT_PARENT_MODEL
+) -> tuple[str, int, int]:
     """Read the parent session's own state off its transcript.
 
     Returns (parent_model_family, context_tokens, turn_count):
@@ -122,51 +172,26 @@ def read_session_state(transcript_path: str | None) -> tuple[str, int, int]:
       - turn_count: user records seen in the tail window (best effort).
 
     Only the last TRANSCRIPT_TAIL_BYTES are read, so cost is flat regardless of
-    session length. Never raises: any problem yields the conservative default
-    (assume an expensive parent, unknown context), which makes the caller
-    inject less, not more.
+    session length; when that tail holds no assistant record, one wider read of
+    TRANSCRIPT_WIDE_BYTES follows. Never raises: with no assistant record at all
+    (the first prompt of a session) or on any problem it yields `fallback` —
+    the model the session started on when SessionStart reported one, else the
+    conservative default (assume an expensive parent, unknown context), which
+    makes the caller inject less, not more.
     """
     try:
         if not transcript_path:
-            return DEFAULT_PARENT_MODEL, 0, 0
+            return fallback, 0, 0
         path = os.path.expanduser(transcript_path)
         size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            if size > TRANSCRIPT_TAIL_BYTES:
-                f.seek(size - TRANSCRIPT_TAIL_BYTES)
-                f.readline()  # discard the partial first line
-            tail = f.read().decode("utf-8", errors="replace")
-
-        turns = 0
-        last_assistant = None
-        for line in tail.splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                rec = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if not isinstance(rec, dict):
-                continue
-            message = rec.get("message")
-            if not isinstance(message, dict):
-                continue
-            role = rec.get("type") or message.get("role")
-            if role == "user":
-                turns += 1
-            elif (
-                role == "assistant"
-                and message.get("model")
-                and message.get("model") != SYNTHETIC_MODEL
-            ):
-                last_assistant = message
+        last_assistant, turns = _scan_transcript(path, size, TRANSCRIPT_TAIL_BYTES)
+        if last_assistant is None and size > TRANSCRIPT_TAIL_BYTES:
+            last_assistant, _ = _scan_transcript(path, size, TRANSCRIPT_WIDE_BYTES)
 
         if last_assistant is None:
-            return DEFAULT_PARENT_MODEL, 0, turns
+            return fallback, 0, turns
 
-        model = str(last_assistant.get("model", "")).lower()
-        parent = next((fam for fam in TIER_RANK if fam in model), DEFAULT_PARENT_MODEL)
+        parent = model_tier(last_assistant.get("model")) or fallback
 
         ctx = 0
         usage = last_assistant.get("usage")
@@ -181,7 +206,7 @@ def read_session_state(transcript_path: str | None) -> tuple[str, int, int]:
                     ctx += int(value)
         return parent, ctx, turns
     except Exception:
-        return DEFAULT_PARENT_MODEL, 0, 0
+        return fallback, 0, 0
 
 
 def _read_router_json(path: str) -> dict:
@@ -680,6 +705,17 @@ def main() -> int:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         return 0
+    if payload.get("hook_event_name") == "SessionStart":
+        # The first prompt of a session has no assistant record to read the
+        # parent model from, so remember the one the session starts on. The
+        # field is optional: without it the default parent applies as before.
+        tier = model_tier(payload.get("model"))
+        if tier and payload.get("session_id"):
+            sid = str(payload["session_id"])
+            state = _session_read(sid)
+            state.update({"model": tier, "ts": int(time.time())})
+            _session_write(sid, state)
+        return 0
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
         return 0
@@ -717,12 +753,14 @@ def main() -> int:
 
     # Parent-session state: which model is holding this conversation, and how
     # full its context already is. Both gate the injection below.
+    session_id = payload.get("session_id")
+    started_on = _session_read(str(session_id)).get("model") if session_id else None
     parent_model, ctx_tokens, _transcript_turns = read_session_state(
-        payload.get("transcript_path")
+        payload.get("transcript_path"),
+        started_on if started_on in TIER_RANK else DEFAULT_PARENT_MODEL,
     )
     ctx_k = ctx_tokens // 1000
     plan_mode = payload.get("permission_mode") == "plan"
-    session_id = payload.get("session_id")
     turns = session_bump(str(session_id)) if session_id else 0
 
     # Session continuity: a short acknowledgement or back-reference continues
@@ -806,7 +844,7 @@ def main() -> int:
                 f"{tier_effort}->{scored_effort}: {effort_reason}"
             )
 
-    # Fable 5.1 is 2.5x the price of Opus 5.5 — manual dispatch only. Clamp a
+    # Fable 5.2 is 2x the price of Opus 5.5 — manual dispatch only. Clamp a
     # classifier-picked fable down to opus unless the user explicitly asked for
     # it (#model=fable) or a project rule pinned it.
     if result.get("model") == "fable" and result.get("source") not in (

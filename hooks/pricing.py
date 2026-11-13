@@ -2,12 +2,12 @@
 """Per-MTok price table + cost helpers, shared by the usage report.
 
 Rates are list prices for the 5.x lineup (Opus 5.5 / Sonnet 5.5 / Haiku 5.5 /
-Fable 5.1). Always label downstream numbers as estimates.
+Fable 5.2). Always label downstream numbers as estimates.
 
 An alias (`opus`, `sonnet`, `haiku`, `fable`) is priced as the CURRENT model of
 that family. A full model id is priced as that exact model when it is one of
 the older models still served (LEGACY_PRICES), and as the family's current
-model otherwise.
+model otherwise. Mythos ids share the Fable family and its prices.
 
 Cache pricing differs per model: cache reads are a per-model fraction of the
 input rate, and cache writes are 2x input (observed writes use the 1-hour TTL).
@@ -30,7 +30,7 @@ def _rates(price_in: float, price_out: float, cache_read_mult: float) -> dict:
 
 # Current lineup, keyed by the alias the worker agents use (`model: opus`).
 PRICES = {
-    "fable": _rates(10.0, 50.0, 0.025),  # Fable 5.1
+    "fable": _rates(8.0, 40.0, 0.025),  # Fable 5.2
     "opus": _rates(4.0, 20.0, 0.05),  # Opus 5.5
     "sonnet": _rates(2.0, 10.0, 0.05),  # Sonnet 5.5
     "haiku": _rates(0.10, 0.50, 0.10),  # Haiku 5.5
@@ -39,6 +39,8 @@ PRICES = {
 # Older models that are still served and keep their own prices, keyed by
 # (family, "major.minor" or "major").
 LEGACY_PRICES = {
+    ("fable", "5.1"): _rates(10.0, 50.0, 0.025),
+    ("fable", "5"): _rates(10.0, 50.0, 0.10),
     ("opus", "5"): _rates(5.0, 25.0, 0.10),
     ("opus", "4.8"): _rates(5.0, 25.0, 0.10),
     ("sonnet", "5"): _rates(2.0, 10.0, 0.10),
@@ -47,7 +49,9 @@ LEGACY_PRICES = {
 
 # claude-<family>-<major>[-<minor>][-<yyyymmdd>]. The minor is 1-2 digits, so an
 # 8-digit date suffix is never mistaken for one.
-_MODEL_ID = re.compile(r"claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2})(?!\d))?")
+_MODEL_ID = re.compile(
+    r"claude-(?:fable|mythos|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2})(?!\d))?"
+)
 
 
 def model_family(model_id: str | None) -> str | None:
@@ -59,7 +63,7 @@ def model_family(model_id: str | None) -> str | None:
     if not model_id:
         return None
     m = model_id.lower()
-    if "fable" in m:
+    if "fable" in m or "mythos" in m:
         return "fable"
     if "opus" in m:
         return "opus"
@@ -81,8 +85,8 @@ def price_for(model: str | None) -> dict | None:
         return None
     m = _MODEL_ID.search(model.lower())
     if m:
-        version = m.group(2) + (f".{m.group(3)}" if m.group(3) else "")
-        legacy = LEGACY_PRICES.get((m.group(1), version))
+        version = m.group(1) + (f".{m.group(2)}" if m.group(2) else "")
+        legacy = LEGACY_PRICES.get((family, version))
         if legacy:
             return legacy
     return PRICES[family]

@@ -216,7 +216,7 @@ check("time: 1 session measured", rep["time"]["sessions"] == 1)
 
 # ── 3b. Savings are priced against each session's own parent ────────────────
 SONNET_55 = "claude-sonnet-5-5"
-FABLE_51 = "claude-fable-5-1"
+FABLE_52 = "claude-fable-5-2"
 WORKER_USAGE = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
 parent_usage = {"input_tokens": 10, "output_tokens": 10}
 with tempfile.TemporaryDirectory() as pdir:
@@ -232,7 +232,7 @@ with tempfile.TemporaryDirectory() as pdir:
     )
     write_jsonl(
         os.path.join(pdir, "p", "s_opus", "subagents", "agent-3.jsonl"),
-        [assistant("f1", FABLE_51, WORKER_USAGE, [], stamp)],
+        [assistant("f1", FABLE_52, WORKER_USAGE, [], stamp)],
     )
     # session on a SONNET parent with the same haiku worker usage
     write_jsonl(

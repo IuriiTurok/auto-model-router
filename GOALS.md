@@ -31,8 +31,8 @@ router's win.
 **Target direction:** ↑ $ saved without a rise in the correction rate (§2).
 
 Prices (per MTok, list): Opus 5.5 $4 in / $20 out · Sonnet 5.5 $2 / $10 ·
-Haiku 5.5 $0.10 / $0.50 · Fable 5.1 $10 / $50 (2.5x Opus). Cache reads are 5% of
-input on Opus/Sonnet 5.5, 10% on Haiku 5.5, 2.5% on Fable 5.1; cache writes are
+Haiku 5.5 $0.10 / $0.50 · Fable 5.2 $8 / $40 (2x Opus). Cache reads are 5% of
+input on Opus/Sonnet 5.5, 10% on Haiku 5.5, 2.5% on Fable 5.2; cache writes are
 2x input (1-hour TTL). Older models still served keep their own prices (see
 `hooks/pricing.py`).
 

@@ -42,7 +42,7 @@ hooks, skills, agents, and commands all load from the plugin, and `bin/cc-route`
 is added to PATH automatically while the plugin is enabled.
 
 > **Do not also apply the "Manual / non-marketplace install" section of
-> [INSTALL.md](INSTALL.md).** It wires the same five hooks by absolute path in
+> [INSTALL.md](INSTALL.md).** It wires the same six hooks by absolute path in
 > `~/.claude/settings.json` and symlinks the components into `~/.claude/`. Doing both
 > at once fires every hook twice and duplicates every skill, agent, and command.
 > It exists only for people who cloned the repo directly instead of installing it.
@@ -337,12 +337,14 @@ for c in route route-status router-report; do
 done
 ```
 
-Then register **all five hooks** in `~/.claude/settings.json` (mirror
+Then register **all six hooks** in `~/.claude/settings.json` (mirror
 `hooks/hooks.json` — see INSTALL.md → "Manual / non-marketplace install" for
 the full block):
 
 ```jsonc
 "hooks": {
+  "SessionStart": [{ "hooks": [{ "type": "command",
+    "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/auto-router.py", "timeout": 5 }] }],
   "UserPromptSubmit": [{ "hooks": [{ "type": "command",
     "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/auto-router.py", "timeout": 5 }] }],
   "PreToolUse":  [{ "matcher": "Agent", "hooks": [{ "type": "command",

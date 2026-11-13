@@ -374,12 +374,12 @@ def close(a, b):
 
 
 # Aliases are priced as the CURRENT model of the family: Opus 5.5 / Sonnet 5.5 /
-# Haiku 5.5 / Fable 5.1 ($/MTok in, out, cache read).
+# Haiku 5.5 / Fable 5.2 ($/MTok in, out, cache read).
 for alias, want in {
     "opus": (4.0, 20.0, 0.20),
     "sonnet": (2.0, 10.0, 0.10),
     "haiku": (0.10, 0.50, 0.01),
-    "fable": (10.0, 50.0, 0.25),
+    "fable": (8.0, 40.0, 0.20),
 }.items():
     check(
         f"pricing: alias {alias} -> in/out/cache_read {want}",
@@ -394,8 +394,8 @@ check(
     ),
 )
 check(
-    "pricing: Fable 5.1 is 2.5x Opus 5.5",
-    close(per_mtok("fable", "in") / per_mtok("opus", "in"), 2.5),
+    "pricing: Fable 5.2 is 2x Opus 5.5",
+    close(per_mtok("fable", "in") / per_mtok("opus", "in"), 2.0),
 )
 
 # Full model ids: the current 5.5 ids price as the alias; older models still
@@ -404,7 +404,11 @@ for model_id, want in {
     "claude-opus-5-5": (4.0, 20.0, 0.20),
     "claude-sonnet-5-5": (2.0, 10.0, 0.10),
     "claude-haiku-5-5": (0.10, 0.50, 0.01),
+    "claude-fable-5-2": (8.0, 40.0, 0.20),
+    "claude-mythos-5-2": (8.0, 40.0, 0.20),
     "claude-fable-5-1": (10.0, 50.0, 0.25),
+    "claude-mythos-5-1": (10.0, 50.0, 0.25),
+    "claude-fable-5": (10.0, 50.0, 1.00),
     "claude-opus-5": (5.0, 25.0, 0.50),
     "claude-opus-5-20260115": (5.0, 25.0, 0.50),
     "claude-opus-4-8": (5.0, 25.0, 0.50),
@@ -447,7 +451,7 @@ check(
     "pricing: a fable worker under an opus parent is a (negative) saving",
     close(
         pricing.saving_vs_parent("fable", "opus", usage_1m),
-        (4.0 + 20.0) - (10.0 + 50.0),
+        (4.0 + 20.0) - (8.0 + 40.0),
     ),
 )
 check(

@@ -115,7 +115,7 @@ The hook walks up from your `cwd` looking for the first
 
 > **Mutually exclusive with steps 1–2 above.** Apply this _only_ if you cloned the
 > repo directly and never ran `/plugin install`. Running both wiring paths at once
-> fires all five hooks twice per event and loads every skill, agent, and command
+> fires all six hooks twice per event and loads every skill, agent, and command
 > twice (once namespaced `auto-model-router:*`, once bare). If you are migrating
 > from a manual install to the marketplace install, remove these hook entries and
 > symlinks first.
@@ -124,10 +124,15 @@ If you wire the plugin by hand instead of via the marketplace (e.g. you
 cloned the repo straight into `~/.claude/plugins/auto-model-router/`), you
 must replicate everything the marketplace would auto-load. **`hooks/hooks.json`
 is the source of truth — mirror ALL of it, not just the first hook.** As of
-v0.9.0 that means **five** hooks:
+v0.9.1 that means **six** hooks:
 
 ```jsonc
 // ~/.claude/settings.json → "hooks"
+"SessionStart": [
+  { "hooks": [{ "type": "command",
+    "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/auto-router.py",
+    "timeout": 5 }] }
+],
 "UserPromptSubmit": [
   { "hooks": [{ "type": "command",
     "command": "python3 $HOME/.claude/plugins/auto-model-router/hooks/auto-router.py",
@@ -202,7 +207,7 @@ want a clean slate.
 Check `~/.claude/settings.json` — under `hooks` there should be either
 marketplace-registered entries (no manual edit needed) or, if you
 installed manually, command entries pointing at the plugin path. There
-are **five** hooks (UserPromptSubmit + PreToolUse[Agent] +
+are **six** hooks (SessionStart + UserPromptSubmit + PreToolUse[Agent] +
 PostToolUse[Agent] + SubagentStop + Stop) — see "Manual / non-marketplace
 install" above.
 Settings.json hook edits take effect in new sessions (or after opening
