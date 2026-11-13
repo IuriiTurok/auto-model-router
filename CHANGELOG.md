@@ -5,6 +5,18 @@ All notable changes to auto-model-router. Format loosely follows
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-11-13
+
+### Fixed
+
+- **Every hook runs on Python 3.9 again.** The hooks annotate with `str | None`,
+  which Python 3.9 evaluates when a function is defined and rejects with a
+  `TypeError`, so each hook crashed at import whenever `python3` resolved to the
+  macOS system interpreter (41 logged hook errors, 26 May to 14 July). The six
+  hooks, `tools/usage-report.py` and three test files now start with
+  `from __future__ import annotations`, as `hooks/waves.py` already did. The
+  suite passes on 3.9 and on the current interpreter.
+
 ## [0.9.1] — 2026-11-13
 
 ### Changed

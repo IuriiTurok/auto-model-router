@@ -21,6 +21,8 @@ Usage:
 See GOALS.md for the metric definitions.
 """
 
+from __future__ import annotations
+
 import argparse
 import glob
 import hashlib

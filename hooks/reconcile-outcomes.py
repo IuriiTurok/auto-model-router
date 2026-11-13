@@ -23,6 +23,8 @@ Contract: fail-open and non-blocking — any error returns 0, and it never emits
 terminal, so re-running the hook does not double-count.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys

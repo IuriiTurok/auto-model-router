@@ -13,6 +13,8 @@ Cache pricing differs per model: cache reads are a per-model fraction of the
 input rate, and cache writes are 2x input (observed writes use the 1-hour TTL).
 """
 
+from __future__ import annotations
+
 import re
 
 CACHE_WRITE_MULT = 2.0

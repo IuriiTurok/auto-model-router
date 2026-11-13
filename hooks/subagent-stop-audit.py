@@ -15,6 +15,8 @@ Idempotent and silent — never blocks the subagent. On any problem it exits 0
 without writing.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re

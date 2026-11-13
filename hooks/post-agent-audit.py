@@ -23,6 +23,8 @@ Idempotent and silent — never blocks the tool call. If the payload
 shape is not what we expect, exits 0 without writing anything.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re

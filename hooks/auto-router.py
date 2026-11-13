@@ -33,6 +33,8 @@ Opt outs:
     / `#model=haiku` / `#model=fable`.
 """
 
+from __future__ import annotations
+
 import glob
 import hashlib
 import json

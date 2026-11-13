@@ -8,6 +8,8 @@ Each hook test isolates its own temp CC_ROUTER_CACHE_DIR and never touches
 the real cache. Exit 0 if all pass; 1 otherwise.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess

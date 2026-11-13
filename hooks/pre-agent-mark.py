@@ -8,6 +8,8 @@ post-agent-audit.py can record realized usage for both. Idempotent and
 silent on any error.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys

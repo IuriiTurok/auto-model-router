@@ -8,6 +8,8 @@ the session it arrives. Uses a temp CC_ROUTER_CACHE_DIR so it never touches the
 real cache. Exit 0 if all pass; 1 otherwise.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess
